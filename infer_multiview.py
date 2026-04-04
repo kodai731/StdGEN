@@ -1,5 +1,8 @@
 import argparse
 import os
+
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.expanduser("~/.cache/torch/inductor"))
+
 import cv2
 import glob
 import numpy as np
@@ -162,6 +165,8 @@ def save_image_numpy(ndarr, fp):
     im = im.resize((1024, 1024), Image.LANCZOS)
     im.save(fp)
 
+VIEWS = ['front', 'front_right', 'right', 'back', 'left', 'front_left']
+
 def run_multiview_infer(dataloader, pipeline, cfg: TestConfig, save_dir, num_levels=3):
     if cfg.seed is None:
         generator = None
@@ -187,7 +192,7 @@ def run_multiview_infer(dataloader, pipeline, cfg: TestConfig, save_dir, num_lev
             imgs_in, None, prompt_embeds=prompt_embeddings,
             generator=generator, guidance_scale=3.0, output_type='pt', num_images_per_prompt=1,
             height=cfg.height, width=cfg.width,
-            num_inference_steps=40, eta=1.0,
+            num_inference_steps=cfg.num_inference_steps, eta=1.0,
             num_levels=num_levels,
         )
 
@@ -222,6 +227,8 @@ def run_multiview_infer(dataloader, pipeline, cfg: TestConfig, save_dir, num_lev
     torch.cuda.empty_cache()    
 
 def load_multiview_pipeline(cfg):
+    import time
+
     pipeline = StableUnCLIPImg2ImgPipeline.from_pretrained(
         cfg.pretrained_path,
         torch_dtype=torch.float32,)
@@ -229,6 +236,14 @@ def load_multiview_pipeline(cfg):
     if torch.cuda.is_available():
         pipeline.to(device)
     pipeline.enable_vae_slicing()
+
+    if not os.environ.get("DIAG_NO_COMPILE"):
+        t0 = time.monotonic()
+        pipeline.unet = torch.compile(pipeline.unet, mode="default")
+        print(f"[torch.compile] UNet compiled (setup: {time.monotonic()-t0:.1f}s)")
+    else:
+        print("[DIAG] torch.compile disabled for diagnostics")
+
     return pipeline
 
 def main(
@@ -263,11 +278,10 @@ if __name__ == '__main__':
     parser.add_argument("--width", type=int, default=576)
     parser.add_argument("--input_dir", type=str, default='./result/apose')
     parser.add_argument("--output_dir", type=str, default='./result/multiview')
+    parser.add_argument("--num_inference_steps", type=int, default=40)
     parser.add_argument("--low_vram", action='store_true')
     cfg = parser.parse_args()
 
-    if cfg.num_views == 6:
-        VIEWS = ['front', 'front_right', 'right', 'back', 'left', 'front_left']
-    else:
+    if cfg.num_views != 6:
         raise NotImplementedError(f"Number of views {cfg.num_views} not supported")
     main(cfg)

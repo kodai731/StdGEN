@@ -1,5 +1,6 @@
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.expanduser("~/.cache/torch/inductor"))
 
 from PIL import Image
 import glob
@@ -189,6 +190,12 @@ def main(
     vae.requires_grad_(False)
     unet.requires_grad_(False)
     ref_unet.requires_grad_(False)
+
+    import time as _time
+    _t0 = _time.monotonic()
+    unet = torch.compile(unet, mode="default")
+    ref_unet = torch.compile(ref_unet, mode="default")
+    print(f"[torch.compile] UNet + ref_unet compiled (setup: {_time.monotonic()-_t0:.1f}s)")
 
     noise_scheduler = DDIMScheduler.from_pretrained(pretrained_model_path, subfolder="scheduler-zerosnr")
     validation_pipeline = CanonicalizationPipeline(

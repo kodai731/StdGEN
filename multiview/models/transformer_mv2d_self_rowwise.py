@@ -577,10 +577,8 @@ class BasicMVTransformerBlock(nn.Module):
             norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
             attention_mask=attention_mask,
-            # multiview_attention=self.multiview_attention,
-            # mvcd_attention=self.mvcd_attention,
             **cross_attention_kwargs,
-        )  
+        )
 
         if self.use_ada_layer_norm_zero:
             attn_output = gate_msa.unsqueeze(1) * attn_output
@@ -960,10 +958,6 @@ class XFormersJointAttnProcessor:
 
 
 class JointAttnProcessor:
-    r"""
-    Default processor for performing attention-related computations.
-    """
-
     def __call__(
         self,
         attn: Attention,
@@ -971,9 +965,9 @@ class JointAttnProcessor:
         encoder_hidden_states=None,
         attention_mask=None,
         temb=None,
-        num_tasks=2
+        num_tasks=2,
+        **kwargs,
     ):
-        
         residual = hidden_states
 
         if attn.spatial_norm is not None:
@@ -990,7 +984,6 @@ class JointAttnProcessor:
         )
         attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
 
-
         if attn.group_norm is not None:
             hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
@@ -1004,31 +997,35 @@ class JointAttnProcessor:
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
 
-        assert num_tasks == 2  # only support two tasks now
+        assert num_tasks == 2
+
+        inner_dim = query.shape[-1]
+        head_dim = inner_dim // attn.heads
 
         def transpose(tensor):
-            tensor_0, tensor_1 = torch.chunk(tensor, dim=0, chunks=2)  # bv hw c
-            tensor = torch.cat([tensor_0, tensor_1], dim=1)  # bv 2hw c
-            return tensor 
-        key  = transpose(key)
-        value = transpose(value)
-        query = transpose(query)
+            t0, t1 = torch.chunk(tensor, dim=0, chunks=2)
+            return torch.cat([t0, t1], dim=1)
 
-        
-        batch_size_inner, seq_len_inner, inner_dim = query.shape
-        head_dim = inner_dim // attn.heads
-        query = query.view(batch_size_inner, seq_len_inner, attn.heads, head_dim).transpose(1, 2)
-        key = key.view(batch_size_inner, -1, attn.heads, head_dim).transpose(1, 2)
-        value = value.view(batch_size_inner, -1, attn.heads, head_dim).transpose(1, 2)
+        jq = transpose(query)
+        jk = transpose(key)
+        jv = transpose(value)
 
-        hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask)
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size_inner, seq_len_inner, inner_dim)
+        b, s, _ = jq.shape
+        jq = jq.view(b, s, attn.heads, head_dim).transpose(1, 2)
+        jk = jk.view(b, -1, attn.heads, head_dim).transpose(1, 2)
+        jv = jv.view(b, -1, attn.heads, head_dim).transpose(1, 2)
+
+        hidden_states = F.scaled_dot_product_attention(
+            jq.bfloat16(), jk.bfloat16(), jv.bfloat16(), attn_mask=attention_mask,
+        ).to(jq.dtype)
+
+        hidden_states = hidden_states.transpose(1, 2).reshape(b, s, inner_dim)
+
+        h0, h1 = hidden_states.chunk(2, dim=1)
+        hidden_states = torch.cat([h0, h1], dim=0)
 
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
-
-        hidden_states_0, hidden_states_1 = hidden_states.chunk(2, dim=1)
-        hidden_states = torch.cat([hidden_states_0, hidden_states_1], dim=0)
 
         if input_ndim == 4:
             hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
