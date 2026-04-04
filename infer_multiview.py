@@ -21,7 +21,7 @@ from tqdm.auto import tqdm
 from einops import rearrange, repeat
 from multiview.pipeline_multiclass import StableUnCLIPImg2ImgPipeline
 
-weight_dtype = torch.float16
+weight_dtype = torch.float32
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def tensor_to_numpy(tensor):
@@ -224,14 +224,11 @@ def run_multiview_infer(dataloader, pipeline, cfg: TestConfig, save_dir, num_lev
 def load_multiview_pipeline(cfg):
     pipeline = StableUnCLIPImg2ImgPipeline.from_pretrained(
         cfg.pretrained_path,
-        torch_dtype=torch.float16,)
-    pipeline.unet.enable_xformers_memory_efficient_attention()
+        torch_dtype=torch.float32,)
+
     if torch.cuda.is_available():
         pipeline.to(device)
-        if cfg.low_vram:
-            print("Using Model CPU Offload and VAE Slicing to save VRAM Usage.")
-            pipeline.enable_model_cpu_offload()
-            pipeline.enable_vae_slicing()
+    pipeline.enable_vae_slicing()
     return pipeline
 
 def main(
@@ -239,8 +236,6 @@ def main(
 ):
     set_seed(cfg.seed)
     pipeline = load_multiview_pipeline(cfg)
-    if torch.cuda.is_available():
-        pipeline.to(device)
 
     image_transforms = [transforms.Resize(int(max(cfg.height, cfg.width))),
                         transforms.CenterCrop((cfg.height, cfg.width)),

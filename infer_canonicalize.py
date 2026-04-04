@@ -1,3 +1,6 @@
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 from PIL import Image
 import glob
 
@@ -31,7 +34,7 @@ from huggingface_hub.file_download import hf_hub_download
 from rm_anime_bg.cli import get_mask, SCALE
 
 check_min_version("0.24.0")
-weight_dtype = torch.float16
+weight_dtype = torch.float32
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
@@ -121,14 +124,12 @@ def inference(validation_pipeline, bkg_remover, input_image, vae, feature_extrac
     imgs_in = process_image(input_image, totensor, val_width, val_height)
     imgs_in = rearrange(imgs_in.unsqueeze(0).unsqueeze(0), "B Nv C H W -> (B Nv) C H W")
 
-    with torch.autocast('cuda' if torch.cuda.is_available() else 'cpu', dtype=weight_dtype):
-        imgs_in = imgs_in.to(device=device)
-        # B*Nv images
-        out = validation_pipeline(prompt=prompts, image=imgs_in.to(weight_dtype), generator=generator, 
-                                  num_inference_steps=timestep, prompt_ids=prompt_ids, 
-                                  height=val_height, width=val_width, unet_condition_type=unet_condition_type, 
-                                  use_noise=use_noise, **validation,)
-        out = rearrange(out, "B C f H W -> (B f) C H W", f=1)
+    imgs_in = imgs_in.to(device=device, dtype=torch.float32)
+    out = validation_pipeline(prompt=prompts, image=imgs_in, generator=generator,
+                              num_inference_steps=timestep, prompt_ids=prompt_ids,
+                              height=val_height, width=val_width, unet_condition_type=unet_condition_type,
+                              use_noise=use_noise, **validation,)
+    out = rearrange(out, "B C f H W -> (B f) C H W", f=1)
 
     img_buf = io.BytesIO()
     save_image(out[0], img_buf, format='PNG')
@@ -157,6 +158,11 @@ def main(
 ):
     *_, config = inspect.getargvalues(inspect.currentframe())
 
+    from vram_monitor import init_log, log_vram, check_vram_before_load, report_all_models
+
+    init_log()
+    log_vram("before model load")
+
     tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_path, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(pretrained_model_path, subfolder="text_encoder")
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(pretrained_model_path, subfolder="image_encoder")
@@ -165,22 +171,31 @@ def main(
     unet = UNetMV2DConditionModel.from_pretrained_2d(pretrained_model_path, subfolder="unet", local_crossattn=local_crossattn, **unet_from_pretrained_kwargs)
     ref_unet = UNetMV2DRefModel.from_pretrained_2d(pretrained_model_path, subfolder="ref_unet", local_crossattn=local_crossattn, **unet_from_pretrained_kwargs)
 
-    text_encoder.to(device, dtype=weight_dtype)
-    image_encoder.to(device, dtype=weight_dtype)
-    vae.to(device, dtype=weight_dtype)
-    ref_unet.to(device, dtype=weight_dtype)
-    unet.to(device, dtype=weight_dtype)
+    report_all_models(
+        text_encoder=text_encoder,
+        image_encoder=image_encoder,
+        vae=vae,
+        unet=unet,
+        ref_unet=ref_unet,
+    )
+
+    for name, model in [("text_encoder", text_encoder), ("image_encoder", image_encoder), ("vae", vae), ("unet", unet), ("ref_unet", ref_unet)]:
+        result = check_vram_before_load(name, model)
+        if result < 0:
+            raise RuntimeError(f"Cannot load {name} to GPU: would exceed VRAM limit")
+        model.to(device)
+        log_vram(f"after {name} to GPU")
 
     vae.requires_grad_(False)
     unet.requires_grad_(False)
     ref_unet.requires_grad_(False)
 
-    # set pipeline
     noise_scheduler = DDIMScheduler.from_pretrained(pretrained_model_path, subfolder="scheduler-zerosnr")
     validation_pipeline = CanonicalizationPipeline(
         vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet, ref_unet=ref_unet,feature_extractor=feature_extractor,image_encoder=image_encoder,
-        scheduler=noise_scheduler
+        scheduler=noise_scheduler,
     )
+    validation_pipeline.enable_vae_slicing()
     validation_pipeline.set_progress_bar_config(disable=True)
 
     bkg_remover = BkgRemover()

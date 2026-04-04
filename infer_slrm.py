@@ -122,7 +122,7 @@ def make3d(images, name, output_dir):
     video_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.mp4")
 
     with torch.no_grad():
-        # get triplane
+        torch.cuda.empty_cache()
         planes = model.forward_planes(images, input_cameras.float())
 
         # get video

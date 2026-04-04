@@ -35,7 +35,8 @@ from torchvision.transforms import InterpolationMode
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 class CanonicalizationPipeline(DiffusionPipeline):
-    _optional_components = []
+    model_cpu_offload_seq = "image_encoder->text_encoder->ref_unet->unet->vae"
+    _optional_components = ["ref_unet", "feature_extractor", "image_encoder"]
 
     def __init__(
         self,
@@ -57,10 +58,7 @@ class CanonicalizationPipeline(DiffusionPipeline):
         image_encoder=None
     ):
         super().__init__()
-        self.ref_unet = ref_unet
-        self.feature_extractor = feature_extractor
-        self.image_encoder = image_encoder
-        
+
         if hasattr(scheduler.config, "steps_offset") and scheduler.config.steps_offset != 1:
             deprecation_message = (
                 f"The configuration file of this scheduler: {scheduler} is outdated. `steps_offset`"
@@ -115,6 +113,9 @@ class CanonicalizationPipeline(DiffusionPipeline):
             tokenizer=tokenizer,
             unet=unet,
             scheduler=scheduler,
+            ref_unet=ref_unet,
+            feature_extractor=feature_extractor,
+            image_encoder=image_encoder,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
 
@@ -124,31 +125,12 @@ class CanonicalizationPipeline(DiffusionPipeline):
     def disable_vae_slicing(self):
         self.vae.disable_slicing()
 
-    def enable_sequential_cpu_offload(self, gpu_id=0):
-        if is_accelerate_available():
-            from accelerate import cpu_offload
-        else:
-            raise ImportError("Please install accelerate via `pip install accelerate`")
-
-        device = torch.device(f"cuda:{gpu_id}")
-
-        for cpu_offloaded_model in [self.unet, self.text_encoder, self.vae]:
-            if cpu_offloaded_model is not None:
-                cpu_offload(cpu_offloaded_model, device)
-
 
     @property
     def _execution_device(self):
-        if self.device != torch.device("meta") or not hasattr(self.unet, "_hf_hook"):
-            return self.device
-        for module in self.unet.modules():
-            if (
-                hasattr(module, "_hf_hook")
-                and hasattr(module._hf_hook, "execution_device")
-                and module._hf_hook.execution_device is not None
-            ):
-                return torch.device(module._hf_hook.execution_device)
-        return self.device
+        if self.unet is not None:
+            return next(self.unet.parameters()).device
+        return torch.device("cuda:0")
 
     def _encode_image(self, image_pil, device, num_images_per_prompt, do_classifier_free_guidance, img_proj=None):
         dtype = next(self.image_encoder.parameters()).dtype
@@ -401,11 +383,10 @@ class CanonicalizationPipeline(DiffusionPipeline):
         do_classifier_free_guidance = guidance_scale > 1.0
         
         # 3. Encode input image
-        image_embeddings, image_latents = self._encode_image(image, device, num_videos_per_prompt, do_classifier_free_guidance, img_proj=img_proj) #torch.Size([64, 1, 768]) torch.Size([64, 4, 32, 32])
-        image_latents = rearrange(image_latents, "(b f) c h w -> b c f h w", f=1) #torch.Size([64, 4, 1, 32, 32])
+        image_embeddings, image_latents = self._encode_image(image, device, num_videos_per_prompt, do_classifier_free_guidance, img_proj=img_proj)
+        image_latents = rearrange(image_latents, "(b f) c h w -> b c f h w", f=1)
 
-        # Encode input prompt
-        text_embeddings = self._encode_prompt( #torch.Size([64, 77, 768])
+        text_embeddings = self._encode_prompt(
             prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt
         )
 
@@ -453,33 +434,31 @@ class CanonicalizationPipeline(DiffusionPipeline):
                 ref_dict = {}
                 if self.ref_unet is not None:
                     noise_pred_cond = self.ref_unet(
-                        cond_latent_model_input,
+                        cond_latent_model_input.float(),
                         t,
-                        encoder_hidden_states=text_embeddings.to(torch.float32),
+                        encoder_hidden_states=text_embeddings.float(),
                         cross_attention_kwargs=dict(mode="w", ref_dict=ref_dict)
                     ).sample.to(dtype=latents_dtype)
-                
-                # text condition for unet 
+
                 text_embeddings_unet = text_embeddings.unsqueeze(1).repeat(1,latents.shape[2],1,1)
                 text_embeddings_unet = rearrange(text_embeddings_unet, 'B Nv d c -> (B Nv) d c')
-                # image condition for unet
                 image_embeddings_unet = image_embeddings.unsqueeze(1).repeat(1,latents.shape[2],1, 1)
                 image_embeddings_unet = rearrange(image_embeddings_unet, 'B Nv d c -> (B Nv) d c')
 
                 encoder_hidden_states_unet_cond = image_embeddings_unet
-                
+
                 if self.ref_unet is not None:
                     noise_pred = self.unet(
-                        latent_model_input.to(torch.float32),
+                        latent_model_input.float(),
                         t,
-                        encoder_hidden_states=encoder_hidden_states_unet_cond.to(torch.float32), 
+                        encoder_hidden_states=encoder_hidden_states_unet_cond.float(),
                         cross_attention_kwargs=dict(mode="r", ref_dict=ref_dict, is_cfg_guidance=do_classifier_free_guidance)
                     ).sample.to(dtype=latents_dtype)
                 else:
                     noise_pred = self.unet(
-                        latent_model_input.to(torch.float32),
+                        latent_model_input.float(),
                         t,
-                        encoder_hidden_states=encoder_hidden_states_unet_cond.to(torch.float32), 
+                        encoder_hidden_states=encoder_hidden_states_unet_cond.float(),
                         cross_attention_kwargs=dict(mode="n", ref_dict=ref_dict, is_cfg_guidance=do_classifier_free_guidance)
                     ).sample.to(dtype=latents_dtype)
                 # perform guidance

@@ -85,10 +85,20 @@ class OSGDecoder(nn.Module):
         sdf = self.net_sdf(sampled_features)
         deformation = self.net_deformation(sampled_features)
 
-        grid_features = torch.index_select(input=sampled_features, index=flexicubes_indices.reshape(-1), dim=1)
-        grid_features = grid_features.reshape(
-            sampled_features.shape[0], flexicubes_indices.shape[0], flexicubes_indices.shape[1] * sampled_features.shape[-1])
-        weight = self.net_weight(grid_features) * 0.1
+        num_cubes = flexicubes_indices.shape[0]
+        verts_per_cube = flexicubes_indices.shape[1]
+        feat_dim = sampled_features.shape[-1]
+
+        CHUNK_SIZE = 200_000
+        weight_chunks = []
+        for start in range(0, num_cubes, CHUNK_SIZE):
+            end = min(start + CHUNK_SIZE, num_cubes)
+            chunk_idx = flexicubes_indices[start:end].reshape(-1)
+            chunk_feat = torch.index_select(input=sampled_features, index=chunk_idx, dim=1)
+            chunk_feat = chunk_feat.reshape(_N, end - start, verts_per_cube * feat_dim)
+            weight_chunks.append(self.net_weight(chunk_feat) * 0.1)
+
+        weight = torch.cat(weight_chunks, dim=1)
 
         return sdf, deformation, weight
     

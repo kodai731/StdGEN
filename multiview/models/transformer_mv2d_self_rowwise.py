@@ -730,17 +730,16 @@ class MVAttnProcessor:
             value = rearrange(value, "(b v) (h w) c -> (b h) (v w) c", v=num_views, h=height)
             query = rearrange(query, "(b v) (h w) c -> (b h) (v w) c", v=num_views, h=height) # torch.Size([192, 384, 320])
 
-        query = attn.head_to_batch_dim(query).contiguous()
-        key = attn.head_to_batch_dim(key).contiguous()
-        value = attn.head_to_batch_dim(value).contiguous()
-        
-        attention_probs = attn.get_attention_scores(query, key, attention_mask)
-        hidden_states = torch.bmm(attention_probs, value)
-        hidden_states = attn.batch_to_head_dim(hidden_states)
+        batch_size_inner, seq_len_inner, inner_dim = query.shape
+        head_dim = inner_dim // attn.heads
+        query = query.view(batch_size_inner, seq_len_inner, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size_inner, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size_inner, -1, attn.heads, head_dim).transpose(1, 2)
 
-        # linear proj
+        hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask)
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size_inner, seq_len_inner, inner_dim)
+
         hidden_states = attn.to_out[0](hidden_states)
-        # dropout
         hidden_states = attn.to_out[1](hidden_states)
         if cd_attention_mid:
             hidden_states = rearrange(hidden_states, "(b h) (v w) c -> b v h w c", v=num_views, h=height)
@@ -1016,21 +1015,21 @@ class JointAttnProcessor:
         query = transpose(query)
 
         
-        query = attn.head_to_batch_dim(query).contiguous()
-        key = attn.head_to_batch_dim(key).contiguous()
-        value = attn.head_to_batch_dim(value).contiguous()
+        batch_size_inner, seq_len_inner, inner_dim = query.shape
+        head_dim = inner_dim // attn.heads
+        query = query.view(batch_size_inner, seq_len_inner, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size_inner, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size_inner, -1, attn.heads, head_dim).transpose(1, 2)
 
-        attention_probs = attn.get_attention_scores(query, key, attention_mask)
-        hidden_states = torch.bmm(attention_probs, value)
-        hidden_states = attn.batch_to_head_dim(hidden_states)
+        hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask)
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size_inner, seq_len_inner, inner_dim)
 
-        
-        # linear proj
         hidden_states = attn.to_out[0](hidden_states)
-        # dropout
         hidden_states = attn.to_out[1](hidden_states)
 
-        hidden_states = torch.cat([hidden_states[:, 0], hidden_states[:, 1]], dim=0)  # 2bv hw c
+        hidden_states_0, hidden_states_1 = hidden_states.chunk(2, dim=1)
+        hidden_states = torch.cat([hidden_states_0, hidden_states_1], dim=0)
+
         if input_ndim == 4:
             hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
 
@@ -1038,5 +1037,5 @@ class JointAttnProcessor:
             hidden_states = hidden_states + residual
 
         hidden_states = hidden_states / attn.rescale_output_factor
-        
+
         return hidden_states
