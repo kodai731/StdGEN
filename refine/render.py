@@ -112,8 +112,7 @@ def render_mesh_vertex_color(mesh, cameras, H, W, blur_radius=0.0, faces_per_pix
     )
 
     # render RGB and depth, get mask
-    with torch.autocast(dtype=input_dtype, device_type=torch.device(device).type):
-        images, _ = renderer(mesh)
+    images, _ = renderer(mesh)
     return images   # BHW4
 
 class Pytorch3DNormalsRenderer: # 100 times slower!!!

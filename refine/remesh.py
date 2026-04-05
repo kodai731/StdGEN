@@ -1,7 +1,8 @@
 # modified from https://github.com/Profactor/continuous-remeshing
 import torch
 import torch.nn.functional as tfunc
-import torch_scatter
+def _scatter_max(src, index, dim, out):
+    out.scatter_reduce_(dim, index, src, reduce="amax", include_self=True)
 from typing import Tuple
 
 def prepend_dummies(
@@ -216,7 +217,7 @@ def collapse_edges(
     vert_rank = torch.zeros(V,dtype=torch.long,device=vertices.device) #V
     edge_rank = rank #E
     for i in range(3):
-        torch_scatter.scatter_max(src=edge_rank[:,None].expand(-1,2).reshape(-1),index=edges.reshape(-1),dim=0,out=vert_rank)
+        _scatter_max(src=edge_rank[:,None].expand(-1,2).reshape(-1),index=edges.reshape(-1),dim=0,out=vert_rank)
         edge_rank,_ = vert_rank[edges].max(dim=-1) #E
     candidates = edges[(edge_rank==rank).logical_and_(priorities>0)] #E',2
 
@@ -334,7 +335,7 @@ def flip_edges(
     rank = torch.zeros_like(order)
     rank[order] = torch.arange(0,len(rank),device=rank.device)
     vertex_rank = torch.zeros((V,4),dtype=torch.long,device=device) #V,4
-    torch_scatter.scatter_max(src=rank[:,None].expand(-1,4),index=edges_neighbors,dim=0,out=vertex_rank)
+    _scatter_max(src=rank[:,None].expand(-1,4),index=edges_neighbors,dim=0,out=vertex_rank)
     vertex_rank,_ = vertex_rank.max(dim=-1) #V
     neighborhood_rank,_ = vertex_rank[edges_neighbors].max(dim=-1) #E'
     flip = rank==neighborhood_rank #E'

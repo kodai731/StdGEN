@@ -1,6 +1,10 @@
+import os
+
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.expanduser("~/.cache/torch/inductor"))
+
+import gc
 import cv2
 import numpy as np
-import os
 import trimesh
 import argparse
 import torch
@@ -14,18 +18,65 @@ from refine.render import NormalsRenderer, calc_vertex_normals
 from pytorch3d.structures import Meshes
 from sklearn.neighbors import KDTree
 
-from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
+from vram_monitor import init_log, log_vram, set_stage
 
-sam = sam_model_registry["vit_h"](checkpoint="./ckpt/sam_vit_h_4b8939.pth").cuda()
-generator = SamAutomaticMaskGenerator(
-    model=sam,
-    points_per_side=64,
-    pred_iou_thresh=0.80,
-    stability_score_thresh=0.92,
-    crop_n_layers=1,
-    crop_n_points_downscale_factor=2,
-    min_mask_region_area=100,
-)
+init_log()
+
+_sam_generator = None
+
+
+def _get_sam_generator():
+    global _sam_generator
+    if _sam_generator is not None:
+        return _sam_generator
+
+    from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
+    log_vram("before SAM load")
+    sam = sam_model_registry["vit_h"](checkpoint="./ckpt/sam_vit_h_4b8939.pth").float().cuda()
+    log_vram("after SAM load")
+    _sam_generator = SamAutomaticMaskGenerator(
+        model=sam,
+        points_per_side=64,
+        pred_iou_thresh=0.80,
+        stability_score_thresh=0.92,
+        crop_n_layers=1,
+        crop_n_points_downscale_factor=2,
+        min_mask_region_area=100,
+    )
+    return _sam_generator
+
+
+def _unload_sam():
+    global _sam_generator
+    if _sam_generator is not None:
+        del _sam_generator
+        _sam_generator = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def filter_fixed_mesh_by_proximity(fixed_v, fixed_f, target_v, margin=0.1):
+    target_np = target_v if isinstance(target_v, np.ndarray) else target_v.numpy()
+    fixed_np = fixed_v.numpy()
+
+    kdtree = KDTree(target_np)
+    dists, _ = kdtree.query(fixed_np, k=1)
+    near_mask = dists.squeeze() < margin
+
+    old_to_new = np.full(len(fixed_np), -1, dtype=np.int64)
+    new_indices = np.where(near_mask)[0]
+    old_to_new[new_indices] = np.arange(len(new_indices))
+
+    fixed_f_np = fixed_f.numpy()
+    v0_near = near_mask[fixed_f_np[:, 0]]
+    v1_near = near_mask[fixed_f_np[:, 1]]
+    v2_near = near_mask[fixed_f_np[:, 2]]
+    face_mask = v0_near & v1_near & v2_near
+
+    new_fixed_v = torch.from_numpy(fixed_np[near_mask])
+    new_fixed_f = torch.from_numpy(old_to_new[fixed_f_np[face_mask]]).long()
+
+    return new_fixed_v, new_fixed_f
 
 
 def fix_vert_color_glb(mesh_path):
@@ -127,7 +178,7 @@ def get_distract_mask(color_0, color_1, normal_0=None, normal_1=None, thres=0.25
     points = np.array(random_sampled_points)[:, ::-1]
     labels = np.ones(len(points), dtype=np.int32)
 
-    masks = generator.generate((color_1 * 255).astype(np.uint8))
+    masks = _get_sam_generator().generate((color_1 * 255).astype(np.uint8))
 
     outside_area = np.abs(color_0 - color_1).sum(axis=-1) < outside_thres
 
@@ -177,7 +228,6 @@ if __name__ == '__main__':
         obj_dir = os.path.join(args.input_obj_dir, test_idx)
 
         fixed_v, fixed_f = None, None
-        flow_vert, flow_vector = None, None
         last_colors, last_normals = None, None
         last_front_color, last_front_normal = None, None
         distract_mask = None
@@ -186,8 +236,14 @@ if __name__ == '__main__':
         mv = mv[[4, 3, 2, 0, 6, 5]]        
         renderer = NormalsRenderer(mv,proj,(1024,1024))
 
-        if not args.no_decompose:  
+        log_vram("before refine loop")
+
+        if not args.no_decompose:
             for name_idx, level in zip([3, 1, 2], [2, 1, 0]):
+                gc.collect()
+                torch.cuda.empty_cache()
+                set_stage(f"decompose_level{level}", step=0)
+                log_vram(f"start level{level}")
                 mesh = trimesh.load(obj_dir + f'_{name_idx}.obj')
                 new_mesh = mesh.split(only_watertight=False)
                 new_mesh = [ j for j in new_mesh if len(j.vertices) >= 300 ]
@@ -230,7 +286,10 @@ if __name__ == '__main__':
                 if last_front_color is not None and level == 0:
                     original_mask, distract_bbox, _, distract_mask = get_distract_mask(last_front_color, np.array(colors[0]).astype(np.float32) / 255.0, outside_ratio=args.outside_ratio)
                     cv2.imwrite(f'{args.output_dir}/{test_idx}/distract_mask.png', distract_mask.astype(np.uint8) * 255)
-                else:  
+
+                    _unload_sam()
+                    log_vram("after SAM unload")
+                else:
                     distract_mask = None
                     distract_bbox = None
 
@@ -243,74 +302,90 @@ if __name__ == '__main__':
 
                 # my mesh flow weight by nearest vertexs
                 if fixed_v is not None and fixed_f is not None and level == 1:
-                    t = trimesh.Trimesh(vertices=mesh_v, faces=mesh_f)
-
-                    fixed_v_cpu = fixed_v.cpu().numpy()
-                    kdtree_anchor = KDTree(fixed_v_cpu)
+                    kdtree_anchor = KDTree(fixed_v.numpy())
                     kdtree_mesh_v = KDTree(mesh_v)
                     _, idx_anchor = kdtree_anchor.query(mesh_v, k=1)
                     _, idx_mesh_v = kdtree_mesh_v.query(mesh_v, k=25)
                     idx_anchor = idx_anchor.squeeze()
-                    neighbors = torch.tensor(mesh_v).cuda()[idx_mesh_v]  # V, 25, 3
-                    # calculate the distances neighbors [V, 25, 3]; mesh_v [V, 3] -> [V, 25]
+                    neighbors = torch.tensor(mesh_v).cuda()[idx_mesh_v]
                     neighbor_dists = torch.norm(neighbors - torch.tensor(mesh_v).cuda()[:, None], dim=-1)
                     neighbor_dists[neighbor_dists > 0.06] = 114514.
                     neighbor_weights = torch.exp(-neighbor_dists * 1.)
                     neighbor_weights = neighbor_weights / neighbor_weights.sum(dim=1, keepdim=True)
-                    anchors = fixed_v[idx_anchor]  # V, 3
-                    anchor_normals = calc_vertex_normals(fixed_v, fixed_f)[idx_anchor]  # V, 3
+                    fv_gpu = fixed_v.cuda()
+                    ff_gpu = fixed_f.cuda()
+                    anchors = fv_gpu[idx_anchor]
+                    anchor_normals = calc_vertex_normals(fv_gpu, ff_gpu)[idx_anchor]
                     dis_anchor = torch.clamp(((anchors - torch.tensor(mesh_v).cuda()) * anchor_normals).sum(-1), min=0) + 0.01
-                    vec_anchor = dis_anchor[:, None] * anchor_normals  # V, 3
-                    vec_anchor = vec_anchor[idx_mesh_v]  # V, 25, 3
-                    weighted_vec_anchor = (vec_anchor * neighbor_weights[:, :, None]).sum(1)  # V, 3
+                    vec_anchor = dis_anchor[:, None] * anchor_normals
+                    vec_anchor = vec_anchor[idx_mesh_v]
+                    weighted_vec_anchor = (vec_anchor * neighbor_weights[:, :, None]).sum(1)
                     mesh_v += weighted_vec_anchor.cpu().numpy()
+                    del fv_gpu, ff_gpu, anchors, anchor_normals, neighbors, neighbor_dists, neighbor_weights
+                    torch.cuda.empty_cache()
 
-                    t = trimesh.Trimesh(vertices=mesh_v, faces=mesh_f)
+                gc.collect()
+                torch.cuda.empty_cache()
 
                 mesh_v = torch.tensor(mesh_v, device='cuda', dtype=torch.float32)
                 mesh_f = torch.tensor(mesh_f, device='cuda')
 
-                new_mesh, simp_v, simp_f = geo_refine(mesh_v, mesh_f, colors, normals, fixed_v=fixed_v, fixed_f=fixed_f, distract_mask=distract_mask, distract_bbox=distract_bbox)
+                level_fixed_v, level_fixed_f = fixed_v, fixed_f
+                if level == 0 and fixed_v is not None:
+                    level_fixed_v, level_fixed_f = filter_fixed_mesh_by_proximity(
+                        fixed_v, fixed_f, mesh_v.cpu(), margin=0.15,
+                    )
+                    log_vram(f"fixed_v filtered: {fixed_v.shape[0]} -> {level_fixed_v.shape[0]}")
+
+                set_stage(f"geo_refine_level{level}")
+                log_vram(f"before geo_refine level{level}")
+                new_mesh, simp_v, simp_f = geo_refine(mesh_v, mesh_f, colors, normals, fixed_v=level_fixed_v, fixed_f=level_fixed_f, distract_mask=distract_mask, distract_bbox=distract_bbox)
+                log_vram(f"after geo_refine level{level}")
 
                 # my mesh flow weight by nearest vertexs
                 try:
                     if fixed_v is not None and fixed_f is not None and level != 0:
                         new_mesh_v = new_mesh.verts_packed().cpu().numpy()
 
-                        fixed_v_cpu = fixed_v.cpu().numpy()
-                        kdtree_anchor = KDTree(fixed_v_cpu)
+                        kdtree_anchor = KDTree(fixed_v.numpy())
                         kdtree_mesh_v = KDTree(new_mesh_v)
                         _, idx_anchor = kdtree_anchor.query(new_mesh_v, k=1)
                         _, idx_mesh_v = kdtree_mesh_v.query(new_mesh_v, k=25)
                         idx_anchor = idx_anchor.squeeze()
-                        neighbors = torch.tensor(new_mesh_v).cuda()[idx_mesh_v]  # V, 25, 3
-                        # calculate the distances neighbors [V, 25, 3]; new_mesh_v [V, 3] -> [V, 25]
+                        neighbors = torch.tensor(new_mesh_v).cuda()[idx_mesh_v]
                         neighbor_dists = torch.norm(neighbors - torch.tensor(new_mesh_v).cuda()[:, None], dim=-1)
                         neighbor_dists[neighbor_dists > 0.06] = 114514.
                         neighbor_weights = torch.exp(-neighbor_dists * 1.)
                         neighbor_weights = neighbor_weights / neighbor_weights.sum(dim=1, keepdim=True)
-                        anchors = fixed_v[idx_anchor]  # V, 3
-                        anchor_normals = calc_vertex_normals(fixed_v, fixed_f)[idx_anchor]  # V, 3
+                        fv_gpu = fixed_v.cuda()
+                        ff_gpu = fixed_f.cuda()
+                        anchors = fv_gpu[idx_anchor]
+                        anchor_normals = calc_vertex_normals(fv_gpu, ff_gpu)[idx_anchor]
                         dis_anchor = torch.clamp(((anchors - torch.tensor(new_mesh_v).cuda()) * anchor_normals).sum(-1), min=0) + 0.01
-                        vec_anchor = dis_anchor[:, None] * anchor_normals  # V, 3
-                        vec_anchor = vec_anchor[idx_mesh_v]  # V, 25, 3
-                        weighted_vec_anchor = (vec_anchor * neighbor_weights[:, :, None]).sum(1)  # V, 3
+                        vec_anchor = dis_anchor[:, None] * anchor_normals
+                        vec_anchor = vec_anchor[idx_mesh_v]
+                        weighted_vec_anchor = (vec_anchor * neighbor_weights[:, :, None]).sum(1)
                         new_mesh_v += weighted_vec_anchor.cpu().numpy()
+                        del fv_gpu, ff_gpu, anchors, anchor_normals, neighbors, neighbor_dists, neighbor_weights
+                        torch.cuda.empty_cache()
 
-                        # replace new_mesh verts with new_mesh_v
                         new_mesh = Meshes(verts=[torch.tensor(new_mesh_v, device='cuda')], faces=new_mesh.faces_list(), textures=new_mesh.textures)
 
-                except Exception as e:
+                except Exception:
                     pass
 
                 os.makedirs(f'{args.output_dir}/{test_idx}', exist_ok=True)
                 save_py3dmesh_with_trimesh_fast(new_mesh, f'{args.output_dir}/{test_idx}/out_{level}.glb', apply_sRGB_to_LinearRGB=True)
 
                 if fixed_v is None:
-                    fixed_v, fixed_f = simp_v, simp_f
+                    fixed_v, fixed_f = simp_v.cpu(), simp_f.cpu()
                 else:
-                    fixed_f = torch.cat([fixed_f, simp_f + fixed_v.shape[0]], dim=0)
-                    fixed_v = torch.cat([fixed_v, simp_v], dim=0)
+                    fixed_f = torch.cat([fixed_f, simp_f.cpu() + fixed_v.shape[0]], dim=0)
+                    fixed_v = torch.cat([fixed_v, simp_v.cpu()], dim=0)
+
+                del new_mesh, simp_v, simp_f, colors, normals, mesh_v, mesh_f, level_fixed_v, level_fixed_f
+                gc.collect()
+                torch.cuda.empty_cache()
 
 
         else:

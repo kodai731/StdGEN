@@ -24,6 +24,10 @@ from tqdm.auto import tqdm
 from einops import rearrange, repeat
 from multiview.pipeline_multiclass import StableUnCLIPImg2ImgPipeline
 
+from vram_monitor import init_log, log_vram, set_stage
+
+init_log()
+
 weight_dtype = torch.float32
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 

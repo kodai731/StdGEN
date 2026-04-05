@@ -11,7 +11,7 @@ from PIL import Image
 from typing import List
 from refine.render import _warmup
 import pymeshlab as ml
-from pymeshlab import Percentage
+from pymeshlab import PercentageValue as Percentage
 import nvdiffrast.torch as dr
 import numpy as np
 

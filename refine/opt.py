@@ -1,7 +1,7 @@
 # modified from https://github.com/Profactor/continuous-remeshing
 import time
 import torch
-import torch_scatter
+import torch.nn.functional as F
 from typing import Tuple
 from .remesh import calc_edge_length, calc_edges, calc_face_collapses, calc_face_normals, calc_vertex_normals, collapse_edges, flip_edges, pack, prepend_dummies, remove_dummies, split_edges
 
@@ -135,8 +135,13 @@ class MeshOptimizer:
         edges,_ = calc_edges(self._faces) #E,2
         E = edges.shape[0]
         edge_smooth = self._smooth[edges] #E,2,S
-        neighbor_smooth = torch.zeros_like(self._smooth) #V,S
-        torch_scatter.scatter_mean(src=edge_smooth.flip(dims=[1]).reshape(E*2,-1),index=edges.reshape(E*2,1),dim=0,out=neighbor_smooth)
+        V_count = self._smooth.shape[0]
+        S = self._smooth.shape[1]
+        src = edge_smooth.flip(dims=[1]).reshape(E * 2, S)
+        idx = edges.reshape(E * 2, 1).expand(-1, S)
+        neighbor_sum = torch.zeros_like(self._smooth).scatter_add_(0, idx, src)
+        neighbor_cnt = torch.zeros(V_count, 1, device=src.device, dtype=src.dtype).scatter_add_(0, edges.reshape(E * 2, 1), torch.ones(E * 2, 1, device=src.device, dtype=src.dtype))
+        neighbor_smooth = neighbor_sum / neighbor_cnt.clamp(min=1)
         
         #apply optional smoothing of m1,m2,nu
         if self._gammas[0]:
@@ -184,7 +189,7 @@ class MeshOptimizer:
         min_edge_len = self._ref_len * (1 - self._edge_len_tol)
         max_edge_len = self._ref_len * (1 + self._edge_len_tol)
         
-        self._vertices_etc,self._faces = remesh(self._vertices_etc,self._faces,min_edge_len,max_edge_len,flip, max_vertices=1e7)
+        self._vertices_etc,self._faces = remesh(self._vertices_etc,self._faces,min_edge_len,max_edge_len,flip, max_vertices=80000)
 
         self._split_vertices_etc()
         self._vertices.requires_grad_()

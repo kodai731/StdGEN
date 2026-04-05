@@ -1,4 +1,7 @@
 import os
+
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.expanduser("~/.cache/torch/inductor"))
+
 import imageio
 import numpy as np
 import torch
@@ -79,6 +82,11 @@ model = model.to(device)
 if IS_FLEXICUBES:
     model.init_flexicubes_geometry(device, fovy=30.0, is_ortho=model.is_ortho)
 model = model.eval()
+
+import time as _time
+_t0 = _time.monotonic()
+model = torch.compile(model, mode="default")
+print(f"[torch.compile] S-LRM model compiled (setup: {_time.monotonic()-_t0:.1f}s)")
 
 print('Loading Finished!')
 
