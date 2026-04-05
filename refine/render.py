@@ -5,16 +5,22 @@ from typing import Tuple
 import torch.nn.functional as tfunc
 
 
-def _warmup(glctx, device=None):
+_shared_glctx = None
+
+def get_shared_glctx(device="cuda"):
+    global _shared_glctx
+    if _shared_glctx is None:
+        _shared_glctx = dr.RasterizeCudaContext(device=device)
+        _warmup_glctx(_shared_glctx, device)
+    return _shared_glctx
+
+def _warmup_glctx(glctx, device=None):
     device = 'cuda' if device is None else device
-    #windows workaround for https://github.com/NVlabs/nvdiffrast/issues/59
     def tensor(*args, **kwargs):
         return torch.tensor(*args, device=device, **kwargs)
     pos = tensor([[[-0.8, -0.8, 0, 1], [0.8, -0.8, 0, 1], [-0.8, 0.8, 0, 1]]], dtype=torch.float32)
     tri = tensor([[0, 1, 2]], dtype=torch.int32)
     dr.rasterize(glctx, pos, tri, resolution=[256, 256])
-
-glctx = dr.RasterizeCudaContext(device="cuda")
 
 class NormalsRenderer:
     
@@ -33,8 +39,7 @@ class NormalsRenderer:
         else:
             self._mvp = mvp
         self._image_size = image_size
-        self._glctx = glctx
-        _warmup(self._glctx, device)
+        self._glctx = get_shared_glctx(device)
 
     def render(self,
             vertices: torch.Tensor, #V,3 float

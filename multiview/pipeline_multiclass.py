@@ -592,49 +592,71 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline):
 
         original_latents = latents.clone()
         image_ls = []
+        half_batch = image_latents.shape[0] // 2
+
+        normal_image_latents = image_latents[:half_batch]
+        color_image_latents = image_latents[half_batch:]
+        normal_prompt_embeds = prompt_embeds[:half_batch]
+        color_prompt_embeds = prompt_embeds[half_batch:]
+
         for level in range(num_levels):
             latents = original_latents.clone()
             eles, focals = [], []
-            # 8. Denoising loop
+
+            level_embeds = image_embeds_ls[level]
+            normal_class_labels = level_embeds[:half_batch]
+            color_class_labels = level_embeds[half_batch:]
+
             for i, t in enumerate(self.progress_bar(timesteps)):
                 if do_classifier_free_guidance:
-                    normal_latents, color_latents = torch.chunk(latents, 2, dim=0)  
-                    latent_model_input = torch.cat([normal_latents, normal_latents, color_latents, color_latents], 0)
+                    normal_latents, color_latents = torch.chunk(latents, 2, dim=0)
+                    normal_input = torch.cat([normal_latents, normal_latents], 0)
+                    color_input = torch.cat([color_latents, color_latents], 0)
                 else:
-                    latent_model_input = latents
+                    half = latents.shape[0] // 2
+                    normal_input = latents[:half]
+                    color_input = latents[half:]
 
-                latent_model_input = torch.cat([
-                        latent_model_input, image_latents
-                    ], dim=1)
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                normal_input = torch.cat([normal_input, normal_image_latents], dim=1)
+                normal_input = self.scheduler.scale_model_input(normal_input, t)
 
-                # predict the noise residual
-                unet_out = self.unet(
-                    latent_model_input,
-                    t,
-                    encoder_hidden_states=prompt_embeds,
+                color_input = torch.cat([color_input, color_image_latents], dim=1)
+                color_input = self.scheduler.scale_model_input(color_input, t)
+
+                normal_out = self.unet(
+                    normal_input, t,
+                    encoder_hidden_states=normal_prompt_embeds,
                     dino_feature=dino_feature,
-                    class_labels=image_embeds_ls[level],
+                    class_labels=normal_class_labels,
                     cross_attention_kwargs=cross_attention_kwargs,
-                    return_dict=False)
-                
-                noise_pred = unet_out[0]
-                if return_elevation_focal:    
-                    uncond_pose, pose  = torch.chunk(unet_out[1], 2, 0) 
+                    return_dict=False,
+                )
+
+                color_out = self.unet(
+                    color_input, t,
+                    encoder_hidden_states=color_prompt_embeds,
+                    dino_feature=dino_feature,
+                    class_labels=color_class_labels,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                    return_dict=False,
+                )
+
+                noise_pred = torch.cat([normal_out[0], color_out[0]], dim=0)
+
+                if return_elevation_focal:
+                    pose_out = torch.cat([normal_out[1], color_out[1]], dim=0)
+                    uncond_pose, pose = torch.chunk(pose_out, 2, 0)
                     pose = uncond_pose + guidance_scale * (pose - uncond_pose)
-                    ele = pose[:, 0].detach().cpu().numpy() # b
-                    eles.append(ele)
-                    focal = pose[:, 1].detach().cpu().numpy()
-                    focals.append(focal)
-                    
-                # perform guidance
+                    eles.append(pose[:, 0].detach().cpu().numpy())
+                    focals.append(pose[:, 1].detach().cpu().numpy())
+
                 if do_classifier_free_guidance:
                     normal_noise_pred_uncond, normal_noise_pred_text, color_noise_pred_uncond, color_noise_pred_text = torch.chunk(noise_pred, 4, dim=0)
-                    
-                    noise_pred_uncond, noise_pred_text = torch.cat([normal_noise_pred_uncond, color_noise_pred_uncond], 0), torch.cat([normal_noise_pred_text, color_noise_pred_text], 0)
+
+                    noise_pred_uncond = torch.cat([normal_noise_pred_uncond, color_noise_pred_uncond], 0)
+                    noise_pred_text = torch.cat([normal_noise_pred_text, color_noise_pred_text], 0)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-                    
-                # compute the previous noisy sample x_t -> x_t-1
+
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
                 if callback is not None and i % callback_steps == 0:

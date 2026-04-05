@@ -1,3 +1,5 @@
+import gc
+
 import torch
 import numpy as np
 import trimesh
@@ -12,6 +14,7 @@ from refine.render import NormalsRenderer, calc_vertex_normals
 
 import pytorch3d
 from pytorch3d.structures import Meshes
+
 
 def remove_color(arr):
     if arr.shape[-1] == 4:
@@ -142,7 +145,6 @@ def reconstruct_stage1(pils: List[Image.Image], steps=100, vertices=None, faces=
     fixed_f_cpu = fixed_f.cpu() if has_fixed else None
     if has_fixed:
         del fixed_v, fixed_f
-        torch.cuda.empty_cache()
         kdtree = KDTree(fixed_v_cpu.numpy())
 
     mask = target_images[..., -1] < 0.5
@@ -188,6 +190,7 @@ def reconstruct_stage1(pils: List[Image.Image], steps=100, vertices=None, faces=
             loss_outside_distract = (_images[0][..., :3][~distract_mask] - target_outside[..., :3][~distract_mask]).pow(2).mean()
 
             loss = loss + loss_distract * 1. + loss_outside_distract * 10.
+            del _images, target_outside
 
         if has_fixed:
             _, idx = kdtree.query(_vertices.detach().cpu().numpy(), k=1)
@@ -210,7 +213,9 @@ def reconstruct_stage1(pils: List[Image.Image], steps=100, vertices=None, faces=
 
         loss.backward()
         opt.step()
-        torch.cuda.empty_cache()
+
+        del loss, loss_expand, loss_target_l2, loss_alpha_target_mask_l2, loss_oob
+        del images, normals, t_mask
 
         if i % remesh_interval == 0 and i >= remesh_start:
             _vertices,_faces = opt.remesh(poisson=False)
@@ -248,9 +253,9 @@ def run_mesh_refine(vertices, faces, pils: List[Image.Image], fixed_v=None, fixe
     fixed_f_cpu = fixed_f.cpu() if has_fixed else None
     if has_fixed:
         del fixed_v, fixed_f
-        torch.cuda.empty_cache()
 
     mask = target_images[..., -1] < 0.5
+    debug_images = None
 
     for i in tqdm(range(steps)):
         if has_fixed:
@@ -274,12 +279,12 @@ def run_mesh_refine(vertices, faces, pils: List[Image.Image], fixed_v=None, fixe
 
         if i < update_warmup or i % update_normal_interval == 0:
             with torch.no_grad():
-                torch.cuda.empty_cache()
                 py3d_mesh = to_py3d_mesh(vertices, faces, normals)
                 cameras = get_cameras_list(azim_list=[180, 225, 270, 0, 90, 135], device=vertices.device, focal=1/1.2)
                 projected = multiview_color_projection(py3d_mesh, pils, cameras_list=cameras, weights=[2,0.8,0.8,2,0.8,0.8], confidence_threshold=0.1, complete_unseen=False, below_confidence_strategy='original', reweight_with_cosangle='linear')
                 _, _, target_normal = from_py3d_mesh(projected)
                 del projected, py3d_mesh, cameras
+                gc.collect()
                 torch.cuda.empty_cache()
 
                 target_normal = target_normal * 2 - 1
@@ -288,22 +293,25 @@ def run_mesh_refine(vertices, faces, pils: List[Image.Image], fixed_v=None, fixe
                 target_normal[:, 0] *= -1
                 target_normal[:, 2] *= -1
 
+                del debug_images
                 debug_images = renderer.render(vertices, target_normal, faces)
-        
+                del target_normal
+
         d_mask = images[..., -1] > 0.5
         loss_debug_l2 = (images[..., :3][d_mask] - debug_images[..., :3][d_mask]).pow(2).mean()
-        
+
         loss_alpha_target_mask_l2 = (images[..., -1][mask] - target_images[..., -1][mask]).pow(2).mean()
-        
+
         loss = loss_debug_l2 + loss_alpha_target_mask_l2
-        
-        # out of box
+
         loss_oob = (vertices.abs() > 0.99).float().mean() * 10
         loss = loss + loss_oob
-        
+
         loss.backward()
         opt.step()
-        torch.cuda.empty_cache()
+
+        del loss, loss_debug_l2, loss_alpha_target_mask_l2, loss_oob
+        del images, normals, d_mask
 
         if i % remesh_interval == 0:
             _vertices,_faces = opt.remesh(poisson=(i in poission_steps))
@@ -332,7 +340,6 @@ def geo_refine(mesh_v, mesh_f, rgb_ls, normal_ls, expansion_weight=0.1, fixed_v=
     fixed_f_cpu = fixed_f.cpu() if has_fixed else None
     if has_fixed:
         del fixed_v, fixed_f
-        torch.cuda.empty_cache()
 
     stage1_lr = 0.08 if not has_fixed else 0.01
     stage1_remesh_interval = 1 if not has_fixed else 30
@@ -347,7 +354,6 @@ def geo_refine(mesh_v, mesh_f, rgb_ls, normal_ls, expansion_weight=0.1, fixed_v=
                                          end_edge_len=0.005, gain=0.05, loss_expansion_weight=expansion_weight,
                                          distract_mask=distract_mask, distract_bbox=distract_bbox)
 
-    import gc
     vertices = vertices.detach().clone()
     faces = faces.detach().clone()
     gc.collect()

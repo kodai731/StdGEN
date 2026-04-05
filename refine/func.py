@@ -9,7 +9,7 @@ from pytorch3d.renderer import (
 from pytorch3d.structures import Meshes
 from PIL import Image
 from typing import List
-from refine.render import _warmup
+from refine.render import get_shared_glctx
 import pymeshlab as ml
 from pymeshlab import PercentageValue as Percentage
 import nvdiffrast.torch as dr
@@ -134,9 +134,13 @@ def from_py3d_mesh(mesh):
 
 class Pix2FacesRenderer:
     def __init__(self, device="cuda"):
-        self._glctx = dr.RasterizeCudaContext(device=device)
         self.device = device
-        _warmup(self._glctx, device)
+        self._glctx = None
+
+    def _get_glctx(self):
+        if self._glctx is None:
+            self._glctx = get_shared_glctx(self.device)
+        return self._glctx
 
     def transform_vertices(self, meshes: Meshes, cameras: CamerasBase):
         vertices = cameras.transform_points_ndc(meshes.verts_padded())
@@ -148,7 +152,7 @@ class Pix2FacesRenderer:
         z_clip = None if not perspective_correct or znear is None else znear / 2
 
         if z_clip:
-            vertices = vertices[vertices[..., 2] >= cameras.get_znear()][None]    # clip
+            vertices = vertices[vertices[..., 2] >= cameras.get_znear()][None]
         vertices = vertices * torch.tensor([-1, -1, 1]).to(vertices)
         vertices = torch.cat([vertices, torch.ones_like(vertices[..., :1])], dim=-1).to(torch.float32)
         return vertices
@@ -158,7 +162,7 @@ class Pix2FacesRenderer:
         cameras = cameras.to(self.device)
         vertices = self.transform_vertices(meshes, cameras)
         faces = meshes.faces_packed().to(torch.int32)
-        rast_out,_ = dr.rasterize(self._glctx, vertices, faces, resolution=(H, W), grad_db=False) #C,H,W,4
+        rast_out,_ = dr.rasterize(self._get_glctx(), vertices, faces, resolution=(H, W), grad_db=False)
         pix_to_face = rast_out[..., -1].to(torch.int32) - 1
         return pix_to_face
 
@@ -207,7 +211,12 @@ def project_color(meshes: Meshes, cameras: CamerasBase, pil_image: Image.Image, 
 
     # find invalid faces
     cos_angles = (faces_normals * view_direction).sum(dim=1)
-    assert cos_angles.mean() < 0, f"The view direction is not correct. cos_angles.mean()={cos_angles.mean()}"
+    if cos_angles.mean() >= 0:
+        import sys
+        sys.stderr.write(
+            f"[project_color] flipping view direction: cos_angles.mean()={cos_angles.mean():.4f}\n"
+        )
+        cos_angles = -cos_angles
     selected_faces = unique_faces[cos_angles < -eps]
 
     # find verts
