@@ -348,6 +348,8 @@ def multiview_color_projection(meshes: Meshes, image_list: List[Image.Image], ca
             weight = (ret['cos_angles'].abs() ** 2 * weight)[:, None]
         if use_alpha:
             weight = weight * ret['valid_alpha']
+        if weight.numel() == 0:
+            continue
         assert weight.min() > -0.0001
         texture_counts[ret['valid_verts']] += weight
         texture_values[ret['valid_verts']] += ret['valid_colors'] * weight

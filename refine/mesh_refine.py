@@ -219,6 +219,8 @@ def reconstruct_stage1(pils: List[Image.Image], steps=100, vertices=None, faces=
 
         if i % remesh_interval == 0 and i >= remesh_start:
             _vertices,_faces = opt.remesh(poisson=False)
+            gc.collect()
+            torch.cuda.empty_cache()
 
     vertices, faces = opt._vertices.detach(), opt._faces.detach()
 
@@ -277,7 +279,8 @@ def run_mesh_refine(vertices, faces, pils: List[Image.Image], fixed_v=None, fixe
         if has_fixed:
             del fv, ff
 
-        if i < update_warmup or i % update_normal_interval == 0:
+        should_update_target = (i == 0) or (i % update_normal_interval == 0)
+        if should_update_target:
             with torch.no_grad():
                 py3d_mesh = to_py3d_mesh(vertices, faces, normals)
                 cameras = get_cameras_list(azim_list=[180, 225, 270, 0, 90, 135], device=vertices.device, focal=1/1.2)
@@ -315,6 +318,8 @@ def run_mesh_refine(vertices, faces, pils: List[Image.Image], fixed_v=None, fixe
 
         if i % remesh_interval == 0:
             _vertices,_faces = opt.remesh(poisson=(i in poission_steps))
+            gc.collect()
+            torch.cuda.empty_cache()
 
     vertices, faces = opt._vertices.detach(), opt._faces.detach()
     

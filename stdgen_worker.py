@@ -331,6 +331,17 @@ def run_refine(mv_dir: str, slrm_dir: str, work_dir: str):
     name_to_level = [(3, 2), (1, 1), (2, 0)]
 
     for mesh_idx, level in name_to_level:
+        if level == 0:
+            last_fc_path = os.path.join(tmp_dir, "last_front_color.npy")
+            if os.path.exists(last_fc_path):
+                sys.stderr.write("[run_refine] generating distract_mask\n")
+                sys.stderr.flush()
+                _run_refine_subprocess("generate_distract_mask", tmp_dir, {
+                    "mv_dir": mv_dir,
+                    "tmp_dir": tmp_dir,
+                    "level": 0,
+                })
+
         params = {
             "slrm_dir": slrm_dir,
             "mv_dir": mv_dir,
@@ -454,7 +465,44 @@ def _remove_overlapping_faces(positions, colors, indices, priority_positions):
     return new_positions, new_colors, new_indices
 
 
-def combine_refined_glbs(refine_dir: str, output_path: str):
+PART_FACE_RATIOS = {"hair": 0.4, "body": 0.35, "full": 0.25}
+
+
+def _decimate_with_vertex_color(positions, colors_u8, indices, target_faces):
+    import pymeshlab as ml
+
+    faces_arr = indices.reshape(-1, 3)
+    if len(faces_arr) <= target_faces:
+        return positions, colors_u8, indices
+
+    colors_f64 = colors_u8.astype("float64") / 255.0
+
+    ms = ml.MeshSet()
+    ms.add_mesh(ml.Mesh(
+        vertex_matrix=positions.astype("float64"),
+        face_matrix=faces_arr.astype("int32"),
+        v_color_matrix=colors_f64,
+    ))
+    ms.meshing_decimation_quadric_edge_collapse(
+        targetfacenum=target_faces,
+        preserveboundary=True,
+        preservenormal=True,
+        preservetopology=True,
+        planarquadric=True,
+        qualitythr=0.5,
+    )
+    m = ms.current_mesh()
+
+    new_positions = m.vertex_matrix().astype("float32")
+    new_faces = m.face_matrix()
+    new_colors_f64 = m.vertex_color_matrix()
+    new_colors_u8 = (new_colors_f64 * 255).clip(0, 255).astype("uint8")
+
+    new_indices = new_faces.ravel().astype("uint32")
+    return new_positions, new_colors_u8, new_indices
+
+
+def combine_refined_glbs(refine_dir: str, output_path: str, target_faces: int = 150000):
     import numpy as np
     from pygltflib import (
         GLTF2, Mesh, Node, Primitive, Accessor, BufferView, Buffer,
@@ -476,6 +524,15 @@ def combine_refined_glbs(refine_dir: str, output_path: str):
             level_data[level] = _remove_overlapping_faces(
                 positions, colors, indices, priority_positions,
             )
+
+    if target_faces > 0:
+        for level, part_name in enumerate(PART_NAMES):
+            positions, colors, indices = level_data[level]
+            part_target = int(target_faces * PART_FACE_RATIOS[part_name])
+            positions, colors, indices = _decimate_with_vertex_color(
+                positions, colors, indices, part_target,
+            )
+            level_data[level] = (positions, colors, indices)
 
     parts_info = []
     blob_parts = []
@@ -614,7 +671,10 @@ def process_request(ctx, request: dict) -> dict:
     sys.stderr.write(f"Refine: {refine_ms:.0f}ms\n")
     sys.stderr.flush()
 
-    vertex_count, face_count, parts_info = combine_refined_glbs(refine_dir, output_path)
+    target_faces = request.get("target_faces", 150000)
+    vertex_count, face_count, parts_info = combine_refined_glbs(
+        refine_dir, output_path, target_faces=target_faces,
+    )
 
     sys.stderr.write("Reloading multiview + S-LRM...\n")
     sys.stderr.flush()
