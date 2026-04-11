@@ -328,33 +328,47 @@ def run_refine(mv_dir: str, slrm_dir: str, work_dir: str):
     tmp_dir = f"/tmp/StdGEN/{os.getpid()}"
     os.makedirs(tmp_dir, exist_ok=True)
 
-    name_to_level = [(3, 2), (1, 1), (2, 0)]
+    no_decompose = not os.path.exists(os.path.join(mv_dir, "level1"))
 
-    for mesh_idx, level in name_to_level:
-        if level == 0:
-            last_fc_path = os.path.join(tmp_dir, "last_front_color.npy")
-            if os.path.exists(last_fc_path):
-                sys.stderr.write("[run_refine] generating distract_mask\n")
-                sys.stderr.flush()
-                _run_refine_subprocess("generate_distract_mask", tmp_dir, {
-                    "mv_dir": mv_dir,
-                    "tmp_dir": tmp_dir,
-                    "level": 0,
-                })
-
-        params = {
+    if no_decompose:
+        sys.stderr.write("[run_refine] no_decompose mode (level0 only)\n")
+        sys.stderr.flush()
+        _run_refine_subprocess("refine_level", tmp_dir, {
             "slrm_dir": slrm_dir,
             "mv_dir": mv_dir,
-            "level": level,
-            "mesh_idx": mesh_idx,
+            "level": 0,
+            "mesh_idx": 0,
             "tmp_dir": tmp_dir,
-        }
+            "no_decompose": True,
+        })
+    else:
+        name_to_level = [(3, 2), (1, 1), (2, 0)]
 
-        sys.stderr.write(f"[run_refine] level={level} start\n")
-        sys.stderr.flush()
-        _run_refine_subprocess("refine_level", tmp_dir, params)
-        sys.stderr.write(f"[run_refine] level={level} done\n")
-        sys.stderr.flush()
+        for mesh_idx, level in name_to_level:
+            if level == 0:
+                last_fc_path = os.path.join(tmp_dir, "last_front_color.npy")
+                if os.path.exists(last_fc_path):
+                    sys.stderr.write("[run_refine] generating distract_mask\n")
+                    sys.stderr.flush()
+                    _run_refine_subprocess("generate_distract_mask", tmp_dir, {
+                        "mv_dir": mv_dir,
+                        "tmp_dir": tmp_dir,
+                        "level": 0,
+                    })
+
+            params = {
+                "slrm_dir": slrm_dir,
+                "mv_dir": mv_dir,
+                "level": level,
+                "mesh_idx": mesh_idx,
+                "tmp_dir": tmp_dir,
+            }
+
+            sys.stderr.write(f"[run_refine] level={level} start\n")
+            sys.stderr.flush()
+            _run_refine_subprocess("refine_level", tmp_dir, params)
+            sys.stderr.write(f"[run_refine] level={level} done\n")
+            sys.stderr.flush()
 
     refine_dir = os.path.join(tmp_dir, "refined")
     return refine_dir

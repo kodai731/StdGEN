@@ -52,28 +52,8 @@ def _decimate_mesh(vertices, faces, target_faces=40000):
 
 MAX_INPUT_FACES = 40000
 
+CAMERA_INDICES = [4, 3, 2, 0, 6, 5]
 
-def _build_fixed_adjacency(faces, num_verts):
-    import torch
-    from refine.remesh import calc_edges
-
-    edges, _ = calc_edges(faces)
-    E = edges.shape[0]
-
-    src_indices = torch.cat([edges[:, 1], edges[:, 0]], dim=0)
-    dst_indices = torch.cat([edges[:, 0], edges[:, 1]], dim=0)
-
-    neighbor_count = torch.zeros(
-        num_verts, 1, device=faces.device, dtype=torch.float32,
-    )
-    neighbor_count.scatter_add_(
-        0,
-        dst_indices.unsqueeze(1),
-        torch.ones(2 * E, 1, device=faces.device, dtype=torch.float32),
-    )
-    neighbor_count = neighbor_count.clamp(min=1)
-
-    return src_indices, dst_indices, neighbor_count
 
 
 def _run_reconstruct_stage1(work_dir: str, params: dict):
@@ -264,17 +244,15 @@ def _run_color_projection(work_dir: str, params: dict):
     }
 
 
-def _load_multiview_images(mv_dir, level, ref_colors, ref_mask, remove_mask=None):
+def _load_multiview_images(mv_dir, level, ref_colors, ref_mask):
     import cv2
     from PIL import Image
     from infer_refine import calc_horizontal_offset, calc_horizontal_offset2
 
-    read_level = 0 if remove_mask is not None else level
-
     colors, normals = [], []
     for i in range(6):
-        color = cv2.imread(os.path.join(mv_dir, f"level{read_level}", f"color_{i}.png"))[..., ::-1]
-        normal = cv2.imread(os.path.join(mv_dir, f"level{read_level}", f"normal_{i}.png"))[..., ::-1]
+        color = cv2.imread(os.path.join(mv_dir, f"level{level}", f"color_{i}.png"))[..., ::-1]
+        normal = cv2.imread(os.path.join(mv_dir, f"level{level}", f"normal_{i}.png"))[..., ::-1]
 
         if ref_colors is not None:
             offset = calc_horizontal_offset(np.array(ref_colors[i]), color)
@@ -284,10 +262,6 @@ def _load_multiview_images(mv_dir, level, ref_colors, ref_mask, remove_mask=None
         if offset != 0:
             color = np.roll(color, offset, axis=1)
             normal = np.roll(normal, offset, axis=1)
-
-        if remove_mask is not None:
-            color[remove_mask[i]] = 255
-            normal[remove_mask[i]] = 255
 
         colors.append(Image.fromarray(color))
         normals.append(Image.fromarray(normal))
@@ -301,7 +275,7 @@ def _generate_ref_mask(mesh_v, mesh_f):
     from refine.render import NormalsRenderer
 
     mv, proj = make_star_cameras_orthographic(8, 1, r=1.2)
-    mv = mv[[4, 3, 2, 0, 6, 5]]
+    mv = mv[CAMERA_INDICES]
     renderer = NormalsRenderer(mv, proj, (1024, 1024))
     images = renderer.render(
         torch.tensor(mesh_v, device="cuda").float(),
@@ -313,7 +287,8 @@ def _generate_ref_mask(mesh_v, mesh_f):
     return ref_mask
 
 
-def _render_silhouette_mask(mesh_path):
+
+def _render_part_mask(mesh_path: str, vertex_mask: np.ndarray):
     import gc
     import torch
     import trimesh
@@ -321,25 +296,83 @@ def _render_silhouette_mask(mesh_path):
     from refine.render import NormalsRenderer
 
     mesh = trimesh.load(mesh_path)
-    parts = mesh.split(only_watertight=False)
-    parts = [p for p in parts if len(p.vertices) >= 300]
-    if not parts:
-        return np.zeros((6, 1024, 1024), dtype=bool)
-    mesh = trimesh.Scene(parts).to_geometry()
+    if isinstance(mesh, trimesh.Scene):
+        mesh = mesh.to_geometry()
+
+    vertices = np.array(mesh.vertices, dtype=np.float32)
+    faces = np.array(mesh.faces)
+
+    colors = np.zeros((len(vertices), 3), dtype=np.float32)
+    colors[vertex_mask] = 1.0
 
     mv, proj = make_star_cameras_orthographic(8, 1, r=1.2)
-    mv = mv[[4, 3, 2, 0, 6, 5]]
+    mv = mv[CAMERA_INDICES]
     renderer = NormalsRenderer(mv, proj, (1024, 1024))
     images = renderer.render(
-        torch.tensor(np.array(mesh.vertices), device="cuda").float(),
-        torch.ones(len(mesh.vertices), 3, device="cuda").float(),
-        torch.tensor(np.array(mesh.faces), device="cuda"),
+        torch.tensor(vertices, device="cuda").float(),
+        torch.tensor(colors, device="cuda").float(),
+        torch.tensor(faces, device="cuda"),
     )
-    mask = (images[..., 3] > 0.5).cpu().numpy()
+    mask = (images[..., 0] > 0.3).cpu().numpy()
     del renderer, images, mv, proj
     gc.collect()
     torch.cuda.empty_cache()
     return mask
+
+
+def _run_generate_levels(work_dir: str, params: dict):
+    import cv2
+    import torch
+    import trimesh
+
+    mv_dir = params["mv_dir"]
+    slrm_dir = params["slrm_dir"]
+
+    level0_dir = os.path.join(mv_dir, "level0")
+
+    if os.path.exists(os.path.join(mv_dir, "level1")):
+        return {"status": "ok", "skipped": True}
+
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    src_dir = os.path.join(project_root, "src")
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
+    from anim_ml.utils.mesh_contraction import segment_humanoid, LABEL_HEAD
+
+    mesh_path = os.path.join(slrm_dir, "mesh_0.obj")
+    mesh = trimesh.load(mesh_path)
+    if isinstance(mesh, trimesh.Scene):
+        mesh = mesh.to_geometry()
+
+    V = torch.tensor(np.array(mesh.vertices), dtype=torch.float32)
+    F = torch.tensor(np.array(mesh.faces), dtype=torch.long)
+
+    sys.stderr.write("[generate_levels] contracting mesh_0 for part labeling\n")
+    sys.stderr.flush()
+    labels = segment_humanoid(V, F, head_ratio=0.20, device="cuda")
+    head_mask = (labels == LABEL_HEAD).numpy()
+    body_mask = ~head_mask
+
+    sys.stderr.write(f"[generate_levels] head={head_mask.sum()} body={body_mask.sum()}\n")
+    sys.stderr.flush()
+
+    head_silhouette = _render_part_mask(mesh_path, head_mask)
+    body_silhouette = _render_part_mask(mesh_path, body_mask)
+
+    for level, silhouette in [(2, head_silhouette), (1, body_silhouette)]:
+        level_dir = os.path.join(mv_dir, f"level{level}")
+        os.makedirs(level_dir, exist_ok=True)
+
+        for i in range(6):
+            for kind in ("color", "normal"):
+                src = cv2.imread(os.path.join(level0_dir, f"{kind}_{i}.png"))
+                src[~silhouette[i]] = 255
+                cv2.imwrite(os.path.join(level_dir, f"{kind}_{i}.png"), src)
+
+        sys.stderr.write(f"[generate_levels] level{level} created\n")
+        sys.stderr.flush()
+
+    return {"status": "ok"}
 
 
 def _run_generate_distract_mask(work_dir: str, params: dict):
@@ -391,22 +424,6 @@ def _run_generate_distract_mask(work_dir: str, params: dict):
     return {"status": "ok"}
 
 
-def _laplacian_smooth(vertices, src_indices, dst_indices, neighbor_count, iterations=2):
-    import torch
-
-    v = vertices.clone()
-    E2 = src_indices.shape[0]
-    for _ in range(iterations):
-        neighbor_sum = torch.zeros_like(v)
-        neighbor_sum.scatter_add_(
-            0,
-            dst_indices.unsqueeze(1).expand(E2, 3),
-            v[src_indices],
-        )
-        neighbor_mean = neighbor_sum / neighbor_count
-        v = 0.5 * v + 0.5 * neighbor_mean
-    return v
-
 
 def _run_refine_level(work_dir: str, params: dict):
     import gc
@@ -414,17 +431,9 @@ def _run_refine_level(work_dir: str, params: dict):
 
     import torch
     from PIL import Image
-    from tqdm import tqdm
 
-    from refine.mesh_refine import simple_remove, erode_alpha, init_target
-    from refine.func import (
-        get_cameras_list, multiview_color_projection,
-        make_star_cameras_orthographic, to_py3d_mesh, from_py3d_mesh,
-    )
-    from refine.render import NormalsRenderer, calc_vertex_normals
+    from refine.mesh_refine import geo_refine
     from infer_refine import save_py3dmesh_with_trimesh_fast
-    import pytorch3d
-    from pytorch3d.structures import Meshes
     import trimesh
 
     slrm_dir = params["slrm_dir"]
@@ -433,7 +442,6 @@ def _run_refine_level(work_dir: str, params: dict):
     mesh_idx = params["mesh_idx"]
     tmp_dir = params["tmp_dir"]
 
-    ref_mask_path = os.path.join(tmp_dir, "ref_mask.npy")
     last_front_color_path = os.path.join(tmp_dir, "last_front_color.npy")
 
     mesh = trimesh.load(os.path.join(slrm_dir, f"mesh_{mesh_idx}.obj"))
@@ -442,16 +450,17 @@ def _run_refine_level(work_dir: str, params: dict):
     mesh = trimesh.Scene(parts).to_geometry()
     mesh_v, mesh_f = mesh.vertices, mesh.faces
 
-    if os.path.exists(ref_mask_path):
-        ref_mask = np.load(ref_mask_path)
+    level_ref_mask_path = os.path.join(tmp_dir, f"ref_mask_level{level}.npy")
+    if os.path.exists(level_ref_mask_path):
+        ref_mask = np.load(level_ref_mask_path)
     else:
         ref_mask = _generate_ref_mask(mesh_v, mesh_f)
-        np.save(ref_mask_path, ref_mask)
+        np.save(level_ref_mask_path, ref_mask)
         gc.collect()
         torch.cuda.empty_cache()
 
     ref_colors = None
-    ref_colors_path = os.path.join(tmp_dir, "ref_colors")
+    ref_colors_path = os.path.join(tmp_dir, f"ref_colors_level{level}")
     if os.path.exists(ref_colors_path):
         ref_colors = []
         for i in range(6):
@@ -459,13 +468,7 @@ def _run_refine_level(work_dir: str, params: dict):
     else:
         os.makedirs(ref_colors_path, exist_ok=True)
 
-    era3d_mode = not os.path.exists(os.path.join(mv_dir, "level1"))
-    remove_mask = None
-    if era3d_mode and level != 0:
-        hair_mesh_path = os.path.join(slrm_dir, "mesh_2.obj")
-        remove_mask = _render_silhouette_mask(hair_mesh_path)
-
-    colors, normals = _load_multiview_images(mv_dir, level, ref_colors, ref_mask, remove_mask)
+    colors, normals = _load_multiview_images(mv_dir, level, ref_colors, ref_mask)
 
     if ref_colors is None:
         ref_colors = deepcopy(colors)
@@ -488,210 +491,52 @@ def _run_refine_level(work_dir: str, params: dict):
     if F > MAX_INPUT_FACES:
         sys.stderr.write(f"[refine_level] decimating {F} -> {MAX_INPUT_FACES} faces\n")
         sys.stderr.flush()
-        mesh_v_dec, mesh_f_dec = _decimate_mesh(
+        mesh_v, mesh_f = _decimate_mesh(
             np.array(mesh_v, dtype="float32"),
             np.array(mesh_f),
             MAX_INPUT_FACES,
         )
-    else:
-        mesh_v_dec = np.array(mesh_v, dtype="float32")
-        mesh_f_dec = np.array(mesh_f)
 
-    vertices = torch.tensor(mesh_v_dec, device="cuda", dtype=torch.float32)
-    faces = torch.tensor(mesh_f_dec, device="cuda").long()
-    V_fixed = vertices.shape[0]
-    F_fixed = faces.shape[0]
+    mesh_v_t = torch.tensor(np.array(mesh_v, dtype="float32"), device="cuda")
+    mesh_f_t = torch.tensor(np.array(mesh_f), device="cuda")
     sys.stderr.write(
-        f"[refine_level] fixed topology: V={V_fixed}, F={F_fixed}\n"
+        f"[refine_level] V={mesh_v_t.shape[0]}, F={mesh_f_t.shape[0]}\n"
     )
     sys.stderr.flush()
 
-    src_indices, dst_indices, neighbor_count = _build_fixed_adjacency(
-        faces, V_fixed,
-    )
+    fixed_v_path = os.path.join(tmp_dir, "fixed_v.npy")
+    fixed_f_path = os.path.join(tmp_dir, "fixed_f.npy")
+    fixed_v, fixed_f = None, None
+    if os.path.exists(fixed_v_path):
+        fixed_v = torch.from_numpy(np.load(fixed_v_path))
+        fixed_f = torch.from_numpy(np.load(fixed_f_path)).long()
 
-    normal_ls = list(normals)
-    rgb_ls = list(colors)
-    rm_normals = simple_remove(normal_ls)
-    for idx, img in enumerate(rm_normals):
-        rgb_ls[idx] = Image.fromarray(
-            np.concatenate([
-                np.array(rgb_ls[idx])[..., :3],
-                np.array(img)[:, :, 3:4],
-            ], axis=-1)
-        )
-    rgb_ls = erode_alpha(rgb_ls)
+    no_decompose = params.get("no_decompose", False)
 
-    mv, proj = make_star_cameras_orthographic(8, 1, r=1.2)
-    mv = mv[[4, 3, 2, 0, 6, 5]]
-    render_size = list(rm_normals[0].size)
-    renderer = NormalsRenderer(mv, proj, render_size)
-    target_images = init_target(rm_normals, new_bkgd=(0., 0., 0.))
-    alpha_mask = target_images[..., -1] < 0.5
-
-    vertices_opt = vertices.detach().clone().requires_grad_(True)
-    optimizer = torch.optim.Adam([vertices_opt], lr=0.08)
-
-    PHASE1_STEPS = 200
-    PHASE2_STEPS = 100
-    TOTAL_STEPS = PHASE1_STEPS + PHASE2_STEPS
-    LR_DECAY = 0.995
-    LAPLACIAN_WEIGHT = 0.02
-    EXPANSION_WEIGHT = 0.1
-    REFINE_NORMAL_INTERVAL = 25
-
-    sys.stderr.write(f"[refine_level] level={level} geometry optimization\n")
+    sys.stderr.write(f"[refine_level] level={level} geo_refine (no_decompose={no_decompose})\n")
     sys.stderr.flush()
 
-    debug_images = None
-    E2 = src_indices.shape[0]
-    dst_expanded = dst_indices.unsqueeze(1).expand(E2, 3).contiguous()
-
-    for i in tqdm(range(TOTAL_STEPS)):
-        optimizer.zero_grad()
-
-        for pg in optimizer.param_groups:
-            pg["lr"] *= LR_DECAY
-
-        normals_v = calc_vertex_normals(vertices_opt, faces)
-
-        if i < PHASE1_STEPS:
-            normals_render = normals_v.clone()
-            normals_render[:, 0] *= -1
-            normals_render[:, 2] *= -1
-
-            images = renderer.render(vertices_opt, normals_render, faces)
-
-            loss_expand = 0.5 * (
-                (vertices_opt + normals_v).detach() - vertices_opt
-            ).pow(2).mean()
-
-            t_mask = images[..., -1] > 0.5
-            loss_target = (
-                images[t_mask] - target_images[t_mask]
-            ).abs().pow(2).mean()
-            loss_alpha = (
-                images[..., -1][alpha_mask] - target_images[..., -1][alpha_mask]
-            ).pow(2).mean()
-
-            loss = loss_target + loss_alpha + loss_expand * EXPANSION_WEIGHT
-
-            if distract_mask is not None:
-                hair_normals = normals_render.clone()
-                _images = renderer.render(vertices_opt, hair_normals, faces)
-                loss_distract = (
-                    _images[0][distract_mask] - target_images[0][distract_mask]
-                ).pow(2).mean()
-
-                target_outside = target_images[0][..., :3].clone()
-                target_outside[~distract_mask] = 0.0
-                loss_outside = (
-                    _images[0][..., :3][~distract_mask]
-                    - target_outside[..., :3][~distract_mask]
-                ).pow(2).mean()
-
-                loss = loss + loss_distract + loss_outside * 10.0
-                del _images, target_outside
-
-            del images, normals_render
-
-        else:
-            images = renderer.render(vertices_opt, normals_v, faces)
-
-            should_update = (i == PHASE1_STEPS) or (
-                (i - PHASE1_STEPS) % REFINE_NORMAL_INTERVAL == 0
-            )
-            if should_update:
-                with torch.no_grad():
-                    py3d_mesh = to_py3d_mesh(vertices_opt, faces, normals_v)
-                    cameras = get_cameras_list(
-                        azim_list=[180, 225, 270, 0, 90, 135],
-                        device=vertices_opt.device, focal=1 / 1.2,
-                    )
-                    projected = multiview_color_projection(
-                        py3d_mesh, rm_normals, cameras_list=cameras,
-                        weights=[2, 0.8, 0.8, 2, 0.8, 0.8],
-                        confidence_threshold=0.1, complete_unseen=False,
-                        below_confidence_strategy="original",
-                        reweight_with_cosangle="linear",
-                    )
-                    _, _, target_normal = from_py3d_mesh(projected)
-                    target_normal = target_normal * 2 - 1
-                    target_normal = torch.nn.functional.normalize(
-                        target_normal, dim=-1,
-                    )
-                    target_normal[:, 0] *= -1
-                    target_normal[:, 2] *= -1
-
-                    del debug_images
-                    debug_images = renderer.render(
-                        vertices_opt, target_normal, faces,
-                    )
-                    del projected, py3d_mesh, cameras, target_normal
-
-            d_mask = images[..., -1] > 0.5
-            loss = (
-                images[..., :3][d_mask] - debug_images[..., :3][d_mask]
-            ).pow(2).mean()
-            loss = loss + (
-                images[..., -1][alpha_mask]
-                - target_images[..., -1][alpha_mask]
-            ).pow(2).mean()
-
-            del images
-
-        with torch.no_grad():
-            neighbor_sum = torch.zeros(V_fixed, 3, device="cuda")
-            neighbor_sum.scatter_add_(0, dst_expanded, vertices_opt.detach()[src_indices])
-            neighbor_mean = neighbor_sum / neighbor_count
-        loss_lap = ((vertices_opt - neighbor_mean.detach()) ** 2).mean() * LAPLACIAN_WEIGHT
-        loss = loss + loss_lap
-
-        loss = loss + (vertices_opt.abs() > 0.99).float().mean() * 10
-
-        loss.backward()
-        optimizer.step()
-
-        del loss, normals_v, loss_lap, neighbor_sum, neighbor_mean
-
-    vertices_final = vertices_opt.detach()
-    del optimizer, vertices_opt, debug_images, dst_expanded
-
-    sys.stderr.write(f"[refine_level] level={level} laplacian smoothing\n")
-    sys.stderr.flush()
-
-    vertices_final = _laplacian_smooth(
-        vertices_final, src_indices, dst_indices, neighbor_count, iterations=2,
+    new_meshes, simp_v, simp_f = geo_refine(
+        mesh_v_t, mesh_f_t,
+        list(colors), list(normals),
+        expansion_weight=0.0 if no_decompose else 0.1,
+        fixed_v=fixed_v, fixed_f=fixed_f,
+        distract_mask=distract_mask, distract_bbox=distract_bbox,
+        no_decompose=no_decompose,
     )
 
-    sys.stderr.write(f"[refine_level] level={level} color_projection\n")
-    sys.stderr.flush()
-
-    color_meshes = Meshes(
-        verts=[vertices_final], faces=[faces],
-        textures=pytorch3d.renderer.mesh.textures.TexturesVertex(
-            [torch.zeros_like(vertices_final).float()]
-        ),
-    )
-
-    cameras_list = get_cameras_list(
-        [180, 225, 270, 0, 90, 135], "cuda", focal=1 / 1.2,
-    )
-    mvp_weights = (
-        [2.0, 0.0, 0.5, 1.0, 0.5, 0.0] if distract_mask is not None
-        else [2.0, 0.5, 0.0, 1.0, 0.0, 0.5]
-    )
-
-    new_meshes = multiview_color_projection(
-        color_meshes, rgb_ls, resolution=1024, device="cuda",
-        complete_unseen=True, confidence_threshold=0.2,
-        cameras_list=cameras_list, weights=mvp_weights,
-        distract_mask=distract_mask,
-    )
-
-    del color_meshes, cameras_list
-    gc.collect()
-    torch.cuda.empty_cache()
+    if fixed_v is None:
+        np.save(fixed_v_path, simp_v.cpu().numpy())
+        np.save(fixed_f_path, simp_f.cpu().numpy())
+    else:
+        combined_v = np.concatenate([fixed_v.numpy(), simp_v.cpu().numpy()], axis=0)
+        combined_f = np.concatenate([
+            fixed_f.numpy(),
+            simp_f.cpu().numpy() + fixed_v.shape[0],
+        ], axis=0)
+        np.save(fixed_v_path, combined_v)
+        np.save(fixed_f_path, combined_f)
+    del fixed_v, fixed_f, simp_v, simp_f
 
     refined_dir = os.path.join(tmp_dir, "refined")
     os.makedirs(refined_dir, exist_ok=True)
@@ -701,6 +546,8 @@ def _run_refine_level(work_dir: str, params: dict):
     vertex_count = int(new_meshes.verts_packed().shape[0])
     face_count = int(new_meshes.faces_packed().shape[0])
     del new_meshes
+    gc.collect()
+    torch.cuda.empty_cache()
 
     return {"vertex_count": vertex_count, "face_count": face_count}
 
@@ -711,6 +558,7 @@ STAGES = {
     "color_projection": _run_color_projection,
     "refine_level": _run_refine_level,
     "generate_distract_mask": _run_generate_distract_mask,
+    "generate_levels": _run_generate_levels,
 }
 
 

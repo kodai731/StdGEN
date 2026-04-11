@@ -117,11 +117,12 @@ def init_target(img_pils, new_bkgd=(0., 0., 0.), device="cuda"):
 
 
 def reconstruct_stage1(pils: List[Image.Image], steps=100, vertices=None, faces=None, fixed_v=None, fixed_f=None, lr=0.03, start_edge_len=0.15, end_edge_len=0.005,
-                       decay=0.995, loss_expansion_weight=0.1, gain=0.1, remesh_interval=1, remesh_start=0, distract_mask=None, distract_bbox=None):
+                       decay=0.995, loss_expansion_weight=0.1, gain=0.1, remesh_interval=1, remesh_start=0, distract_mask=None, distract_bbox=None,
+                       camera_indices=None):
     vertices, faces = vertices.cuda(), faces.cuda()
     assert len(pils) == 6
     mv, proj = make_star_cameras_orthographic(8, 1, r=1.2)
-    mv = mv[[4, 3, 2, 0, 6, 5]]
+    mv = mv[camera_indices or [4, 3, 2, 0, 6, 5]]
 
     render_size = list(pils[0].size)
     if fixed_v is not None:
@@ -228,12 +229,13 @@ def reconstruct_stage1(pils: List[Image.Image], steps=100, vertices=None, faces=
 
 
 def run_mesh_refine(vertices, faces, pils: List[Image.Image], fixed_v=None, fixed_f=None, steps=100, start_edge_len=0.02, end_edge_len=0.005,
-                    decay=0.99, update_normal_interval=10, update_warmup=10, return_mesh=True, process_inputs=True, process_outputs=True, remesh_interval=20):
+                    decay=0.99, update_normal_interval=10, update_warmup=10, return_mesh=True, process_inputs=True, process_outputs=True, remesh_interval=20,
+                    camera_indices=None, azim_list=None):
     poission_steps = []
 
     assert len(pils) == 6
     mv, proj = make_star_cameras_orthographic(8, 1, r=1.2)
-    mv = mv[[4, 3, 2, 0, 6, 5]]
+    mv = mv[camera_indices or [4, 3, 2, 0, 6, 5]]
 
     render_size = list(pils[0].size)
     if fixed_v is not None:
@@ -279,11 +281,11 @@ def run_mesh_refine(vertices, faces, pils: List[Image.Image], fixed_v=None, fixe
         if has_fixed:
             del fv, ff
 
-        should_update_target = (i == 0) or (i % update_normal_interval == 0)
-        if should_update_target:
+        if i < update_warmup or i % update_normal_interval == 0:
             with torch.no_grad():
                 py3d_mesh = to_py3d_mesh(vertices, faces, normals)
-                cameras = get_cameras_list(azim_list=[180, 225, 270, 0, 90, 135], device=vertices.device, focal=1/1.2)
+                _azim = azim_list or [180, 225, 270, 0, 90, 135]
+                cameras = get_cameras_list(azim_list=_azim, device=vertices.device, focal=1/1.2)
                 projected = multiview_color_projection(py3d_mesh, pils, cameras_list=cameras, weights=[2,0.8,0.8,2,0.8,0.8], confidence_threshold=0.1, complete_unseen=False, below_confidence_strategy='original', reweight_with_cosangle='linear')
                 _, _, target_normal = from_py3d_mesh(projected)
                 del projected, py3d_mesh, cameras
@@ -331,7 +333,8 @@ def run_mesh_refine(vertices, faces, pils: List[Image.Image], fixed_v=None, fixe
 
 
 def geo_refine(mesh_v, mesh_f, rgb_ls, normal_ls, expansion_weight=0.1, fixed_v=None, fixed_f=None,
-               distract_mask=None, distract_bbox=None, thres=3e-6, no_decompose=False):
+               distract_mask=None, distract_bbox=None, thres=3e-6, no_decompose=False,
+               camera_indices=None, azim_list=None):
     rm_normals = simple_remove(normal_ls)
 
     for idx, img in enumerate(rm_normals):
@@ -357,7 +360,8 @@ def geo_refine(mesh_v, mesh_f, rgb_ls, normal_ls, expansion_weight=0.1, fixed_v=
                                          fixed_v=fixed_v_cpu, fixed_f=fixed_f_cpu,
                                          lr=stage1_lr, remesh_interval=stage1_remesh_interval, start_edge_len=0.02,
                                          end_edge_len=0.005, gain=0.05, loss_expansion_weight=expansion_weight,
-                                         distract_mask=distract_mask, distract_bbox=distract_bbox)
+                                         distract_mask=distract_mask, distract_bbox=distract_bbox,
+                                         camera_indices=camera_indices)
 
     vertices = vertices.detach().clone()
     faces = faces.detach().clone()
@@ -366,9 +370,10 @@ def geo_refine(mesh_v, mesh_f, rgb_ls, normal_ls, expansion_weight=0.1, fixed_v=
 
     vertices, faces = run_mesh_refine(vertices, faces, rm_normals,
                                       fixed_v=fixed_v_cpu, fixed_f=fixed_f_cpu,
-                                      steps=100, start_edge_len=0.005, end_edge_len=0.001,
-                                      decay=0.99, update_normal_interval=20, update_warmup=2,
-                                      process_inputs=False, process_outputs=False, remesh_interval=5)
+                                      steps=100, start_edge_len=0.005, end_edge_len=0.0002,
+                                      decay=0.99, update_normal_interval=20, update_warmup=5,
+                                      process_inputs=False, process_outputs=False, remesh_interval=1,
+                                      camera_indices=camera_indices, azim_list=azim_list)
     meshes = simple_clean_mesh(to_pyml_mesh(vertices, faces), apply_smooth=True, stepsmoothnum=2, apply_sub_divide=False, sub_divide_threshold=0.25).to("cuda")
     simp_vertices, simp_faces = meshes.verts_packed(), meshes.faces_packed()
     vertices, faces = simp_vertices.detach().cpu().numpy(), simp_faces.detach().cpu().numpy()
@@ -395,7 +400,8 @@ def geo_refine(mesh_v, mesh_f, rgb_ls, normal_ls, expansion_weight=0.1, fixed_v=
     torch.cuda.empty_cache()
 
     meshes = Meshes(verts=[vertices], faces=[faces], textures=pytorch3d.renderer.mesh.textures.TexturesVertex([torch.zeros_like(vertices).float()]))
-    cameras_list = get_cameras_list([180, 225, 270, 0, 90, 135], "cuda", focal=1/1.2)
+    _azim = azim_list or [180, 225, 270, 0, 90, 135]
+    cameras_list = get_cameras_list(_azim, "cuda", focal=1/1.2)
     mvp_weights = [2.0, 0.5, 0.0, 1.0, 0.0, 0.5] if distract_mask is None else [2.0, 0.0, 0.5, 1.0, 0.5, 0.0]
     new_meshes = multiview_color_projection(meshes, rgb_ls, resolution=1024, device="cuda", complete_unseen=True, confidence_threshold=0.2, cameras_list=cameras_list, weights=mvp_weights, distract_mask=distract_mask)
     del meshes, cameras_list
