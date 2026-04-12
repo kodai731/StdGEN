@@ -21,7 +21,7 @@ import torch
 import trimesh
 from PIL import Image
 
-from refine.func import make_star_cameras_orthographic
+from refine.func import STDGEN_VIEWS, make_star_cameras_orthographic
 from refine.mesh_refine import geo_refine
 from refine.render import NormalsRenderer, calc_vertex_normals
 from sklearn.neighbors import KDTree
@@ -47,7 +47,7 @@ def build_fixed_cache():
     last_colors, last_normals = None, None
 
     mv, proj = make_star_cameras_orthographic(8, 1, r=1.2)
-    mv = mv[[4, 3, 2, 0, 6, 5]]
+    mv = mv[STDGEN_VIEWS.camera_indices]
     renderer = NormalsRenderer(mv, proj, (1024, 1024))
 
     for name_idx, level in zip([3, 1], [2, 1]):

@@ -189,7 +189,7 @@ class MeshOptimizer:
         min_edge_len = self._ref_len * (1 - self._edge_len_tol)
         max_edge_len = self._ref_len * (1 + self._edge_len_tol)
         
-        self._vertices_etc,self._faces = remesh(self._vertices_etc,self._faces,min_edge_len,max_edge_len,flip, max_vertices=40000)
+        self._vertices_etc,self._faces = remesh(self._vertices_etc,self._faces,min_edge_len,max_edge_len,flip, max_vertices=1e7)
 
         self._split_vertices_etc()
         self._vertices.requires_grad_()

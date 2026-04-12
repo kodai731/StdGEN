@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import torch
 from pytorch3d.renderer.cameras import look_at_view_transform, OrthographicCameras, CamerasBase
 from pytorch3d.renderer import (
@@ -14,6 +16,42 @@ import pymeshlab as ml
 from pymeshlab import PercentageValue as Percentage
 import nvdiffrast.torch as dr
 import numpy as np
+
+
+@dataclass(frozen=True)
+class CameraViewConfig:
+    camera_indices: list[int]
+    azim_list: list[int]
+    projection_weights: list[float]
+    projection_weights_distract: list[float]
+
+    def get_projection_weights(self, distract: bool) -> list[float]:
+        return self.projection_weights_distract if distract else self.projection_weights
+
+
+STDGEN_VIEWS = CameraViewConfig(
+    camera_indices=[4, 3, 2, 0, 6, 5],
+    azim_list=[180, 225, 270, 0, 90, 135],
+    projection_weights=[2.0, 0.5, 0.0, 1.0, 0.0, 0.5],
+    projection_weights_distract=[2.0, 0.0, 0.5, 1.0, 0.5, 0.0],
+)
+
+ERA3D_VIEWS = CameraViewConfig(
+    camera_indices=[0, 1, 2, 4, 6, 7],
+    azim_list=[0, 315, 270, 180, 90, 45],
+    projection_weights=[2.0, 0.5, 0.0, 1.0, 0.0, 0.5],
+    projection_weights_distract=[2.0, 0.0, 0.5, 1.0, 0.5, 0.0],
+)
+
+
+_VIEW_CONFIGS = {
+    tuple(STDGEN_VIEWS.azim_list): STDGEN_VIEWS,
+    tuple(ERA3D_VIEWS.azim_list): ERA3D_VIEWS,
+}
+
+
+def _find_view_config_by_azim(azim_list: list[int]) -> CameraViewConfig:
+    return _VIEW_CONFIGS.get(tuple(azim_list), STDGEN_VIEWS)
 
 
 def _translation(x, y, z, device):

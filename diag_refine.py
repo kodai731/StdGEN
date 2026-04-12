@@ -17,6 +17,7 @@ import cv2
 from vram_monitor import init_log, log_vram, set_stage
 from refine.mesh_refine import simple_remove, erode_alpha, init_target, reconstruct_stage1
 from refine.func import (
+    STDGEN_VIEWS,
     make_star_cameras_orthographic, to_py3d_mesh, get_cameras_list,
     multiview_color_projection, from_py3d_mesh, get_visible_faces, project_color,
 )
@@ -87,7 +88,7 @@ def test_reconstruct_stage1(mesh_v, mesh_f, rm_normals):
     faces = torch.tensor(mesh_f, device="cuda")
 
     mv, proj = make_star_cameras_orthographic(8, 1, r=1.2)
-    mv = mv[[4, 3, 2, 0, 6, 5]]
+    mv = mv[STDGEN_VIEWS.camera_indices]
     renderer = NormalsRenderer(mv, proj, list(rm_normals[0].size))
     target_images = init_target(rm_normals, new_bkgd=(0., 0., 0.))
     diag("stage1_target_images", target=target_images)
@@ -126,7 +127,7 @@ def test_run_mesh_refine(vertices, faces, rm_normals):
     log_vram("stage2_after_cache_clear")
 
     mv, proj = make_star_cameras_orthographic(8, 1, r=1.2)
-    mv = mv[[4, 3, 2, 0, 6, 5]]
+    mv = mv[STDGEN_VIEWS.camera_indices]
     renderer = NormalsRenderer(mv, proj, list(rm_normals[0].size))
     target_images = init_target(rm_normals, new_bkgd=(0., 0., 0.))
 
@@ -159,7 +160,7 @@ def test_run_mesh_refine(vertices, faces, rm_normals):
                      py3d_faces=py3d_mesh.faces_packed())
 
                 cameras = get_cameras_list(
-                    azim_list=[180, 225, 270, 0, 90, 135],
+                    azim_list=STDGEN_VIEWS.azim_list,
                     device=_vertices.device, focal=1/1.2,
                 )
                 diag(f"stage2_step{i}_cameras_ready")

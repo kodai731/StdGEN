@@ -52,8 +52,6 @@ def _decimate_mesh(vertices, faces, target_faces=40000):
 
 MAX_INPUT_FACES = 40000
 
-CAMERA_INDICES = [4, 3, 2, 0, 6, 5]
-
 
 
 def _run_reconstruct_stage1(work_dir: str, params: dict):
@@ -167,6 +165,7 @@ def _run_color_projection(work_dir: str, params: dict):
     from pytorch3d.structures import Meshes
     from refine.mesh_refine import merge_small_faces
     from refine.func import (
+        STDGEN_VIEWS,
         get_cameras_list, multiview_color_projection,
         simple_clean_mesh, to_pyml_mesh,
     )
@@ -214,13 +213,9 @@ def _run_color_projection(work_dir: str, params: dict):
     if os.path.exists(os.path.join(work_dir, "distract_mask.npy")):
         distract_mask = np.load(os.path.join(work_dir, "distract_mask.npy"))
 
-    cameras_list = get_cameras_list(
-        [180, 225, 270, 0, 90, 135], "cuda", focal=1 / 1.2,
-    )
-    mvp_weights = (
-        [2.0, 0.0, 0.5, 1.0, 0.5, 0.0] if distract_mask is not None
-        else [2.0, 0.5, 0.0, 1.0, 0.0, 0.5]
-    )
+    views = STDGEN_VIEWS
+    cameras_list = get_cameras_list(views.azim_list, "cuda", focal=1 / 1.2)
+    mvp_weights = views.get_projection_weights(distract=distract_mask is not None)
 
     new_meshes = multiview_color_projection(
         meshes, rgb_ls, resolution=1024, device="cuda",
@@ -269,14 +264,14 @@ def _load_multiview_images(mv_dir, level, ref_colors, ref_mask):
     return colors, normals
 
 
-def _generate_ref_mask(mesh_v, mesh_f):
+def _generate_ref_mask(mesh_v, mesh_f, resolution=1024, camera_indices=None):
     import torch
-    from refine.func import make_star_cameras_orthographic
+    from refine.func import STDGEN_VIEWS, make_star_cameras_orthographic
     from refine.render import NormalsRenderer
 
     mv, proj = make_star_cameras_orthographic(8, 1, r=1.2)
-    mv = mv[CAMERA_INDICES]
-    renderer = NormalsRenderer(mv, proj, (1024, 1024))
+    mv = mv[camera_indices or STDGEN_VIEWS.camera_indices]
+    renderer = NormalsRenderer(mv, proj, (resolution, resolution))
     images = renderer.render(
         torch.tensor(mesh_v, device="cuda").float(),
         torch.ones_like(torch.from_numpy(np.array(mesh_v)), device="cuda").float(),
@@ -292,7 +287,7 @@ def _render_part_mask(mesh_path: str, vertex_mask: np.ndarray):
     import gc
     import torch
     import trimesh
-    from refine.func import make_star_cameras_orthographic
+    from refine.func import STDGEN_VIEWS, make_star_cameras_orthographic
     from refine.render import NormalsRenderer
 
     mesh = trimesh.load(mesh_path)
@@ -306,7 +301,7 @@ def _render_part_mask(mesh_path: str, vertex_mask: np.ndarray):
     colors[vertex_mask] = 1.0
 
     mv, proj = make_star_cameras_orthographic(8, 1, r=1.2)
-    mv = mv[CAMERA_INDICES]
+    mv = mv[STDGEN_VIEWS.camera_indices]
     renderer = NormalsRenderer(mv, proj, (1024, 1024))
     images = renderer.render(
         torch.tensor(vertices, device="cuda").float(),
@@ -441,6 +436,7 @@ def _run_refine_level(work_dir: str, params: dict):
     level = params["level"]
     mesh_idx = params["mesh_idx"]
     tmp_dir = params["tmp_dir"]
+    normal_flip = params.get("normal_flip")
 
     last_front_color_path = os.path.join(tmp_dir, "last_front_color.npy")
 
@@ -450,11 +446,18 @@ def _run_refine_level(work_dir: str, params: dict):
     mesh = trimesh.Scene(parts).to_geometry()
     mesh_v, mesh_f = mesh.vertices, mesh.faces
 
+    import cv2
+    sample_img = cv2.imread(os.path.join(mv_dir, f"level{level}", "color_0.png"))
+    mv_resolution = sample_img.shape[0]
+
     level_ref_mask_path = os.path.join(tmp_dir, f"ref_mask_level{level}.npy")
     if os.path.exists(level_ref_mask_path):
         ref_mask = np.load(level_ref_mask_path)
     else:
-        ref_mask = _generate_ref_mask(mesh_v, mesh_f)
+        from refine.func import ERA3D_VIEWS, STDGEN_VIEWS
+        view_cfg = ERA3D_VIEWS if normal_flip is not None else STDGEN_VIEWS
+        ref_mask = _generate_ref_mask(mesh_v, mesh_f, resolution=mv_resolution,
+                                      camera_indices=view_cfg.camera_indices)
         np.save(level_ref_mask_path, ref_mask)
         gc.collect()
         torch.cuda.empty_cache()
@@ -513,17 +516,42 @@ def _run_refine_level(work_dir: str, params: dict):
 
     no_decompose = params.get("no_decompose", False)
 
-    sys.stderr.write(f"[refine_level] level={level} geo_refine (no_decompose={no_decompose})\n")
-    sys.stderr.flush()
+    from refine.mesh_refine import set_debug_dir
+    debug_dir = params.get("debug_dir")
+    if debug_dir:
+        set_debug_dir(debug_dir)
 
-    new_meshes, simp_v, simp_f = geo_refine(
-        mesh_v_t, mesh_f_t,
-        list(colors), list(normals),
-        expansion_weight=0.0 if no_decompose else 0.1,
-        fixed_v=fixed_v, fixed_f=fixed_f,
-        distract_mask=distract_mask, distract_bbox=distract_bbox,
-        no_decompose=no_decompose,
-    )
+    use_poisson = normal_flip is not None
+
+    if use_poisson:
+        sys.stderr.write(f"[refine_level] level={level} geo_refine_poisson (ERA3D mode)\n")
+        sys.stderr.flush()
+
+        from refine.func import ERA3D_VIEWS
+        from refine.mesh_refine import geo_refine_poisson
+
+        new_meshes, simp_v, simp_f = geo_refine_poisson(
+            mesh_v_t, mesh_f_t,
+            list(colors), list(normals),
+            fixed_v=fixed_v, fixed_f=fixed_f,
+            distract_mask=distract_mask,
+            camera_indices=ERA3D_VIEWS.camera_indices,
+            azim_list=ERA3D_VIEWS.azim_list,
+            normal_flip=normal_flip,
+        )
+    else:
+        sys.stderr.write(f"[refine_level] level={level} geo_refine (no_decompose={no_decompose})\n")
+        sys.stderr.flush()
+
+        new_meshes, simp_v, simp_f = geo_refine(
+            mesh_v_t, mesh_f_t,
+            list(colors), list(normals),
+            expansion_weight=0.0 if no_decompose else 0.1,
+            fixed_v=fixed_v, fixed_f=fixed_f,
+            distract_mask=distract_mask, distract_bbox=distract_bbox,
+            no_decompose=no_decompose,
+            normal_flip=normal_flip,
+        )
 
     if fixed_v is None:
         np.save(fixed_v_path, simp_v.cpu().numpy())

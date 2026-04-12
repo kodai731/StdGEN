@@ -68,27 +68,29 @@ def load_multiview_embeddings():
     return normal_embeds, color_embeds
 
 
-def load_all(device: str) -> dict:
-    sys.stderr.write("Loading StdGEN models...\n")
+def load_all(device: str, mode: str = "stdgen") -> dict:
+    sys.stderr.write(f"Loading models (mode={mode})...\n")
     sys.stderr.flush()
 
     t0 = time.monotonic()
-    multiview_pipeline = load_multiview_pipeline(device)
-    normal_embeds, color_embeds = load_multiview_embeddings()
+
+    ctx: dict = {"device": device, "mode": mode}
+
+    if mode != "era3d":
+        ctx["multiview_pipeline"] = load_multiview_pipeline(device)
+        normal_embeds, color_embeds = load_multiview_embeddings()
+        ctx["normal_embeds"] = normal_embeds
+        ctx["color_embeds"] = color_embeds
+
     slrm_model, slrm_infer_config = load_slrm_model(device)
+    ctx["slrm_model"] = slrm_model
+    ctx["slrm_infer_config"] = slrm_infer_config
 
     elapsed = time.monotonic() - t0
-    sys.stderr.write(f"All StdGEN models loaded in {elapsed:.1f}s\n")
+    sys.stderr.write(f"All models loaded in {elapsed:.1f}s (mode={mode})\n")
     sys.stderr.flush()
 
-    return {
-        "device": device,
-        "multiview_pipeline": multiview_pipeline,
-        "normal_embeds": normal_embeds,
-        "color_embeds": color_embeds,
-        "slrm_model": slrm_model,
-        "slrm_infer_config": slrm_infer_config,
-    }
+    return ctx
 
 
 def run_multiview(ctx, input_image_path: str, work_dir: str, seed: int):
@@ -324,7 +326,63 @@ def _run_refine_subprocess(stage: str, level_work_dir: str, params: dict | None 
 
 
 
-def run_refine(mv_dir: str, slrm_dir: str, work_dir: str):
+def run_era3d_multiview(input_image_path: str, work_dir: str, seed: int) -> str:
+    import subprocess
+    import threading
+
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    era3d_script = os.path.join(project_root, "scripts", "era3d_worker.py")
+    python_bin = sys.executable
+    era3d_work_dir = os.path.join(work_dir, "era3d_tmp")
+    os.makedirs(era3d_work_dir, exist_ok=True)
+
+    mv_dir = os.path.join(work_dir, "multiview")
+    device = "cuda"
+
+    for stage in ("encode", "denoise", "decode"):
+        params = {
+            "image_path": input_image_path,
+            "device": device,
+            "seed": seed,
+            "output_dir": work_dir,
+            "num_inference_steps": 40,
+        }
+        cmd = [
+            python_bin, era3d_script,
+            "--stage", stage,
+            "--work-dir", era3d_work_dir,
+            "--params-json", json.dumps(params),
+        ]
+        sys.stderr.write(f"[era3d] {stage} start\n")
+        sys.stderr.flush()
+
+        proc = subprocess.Popen(
+            cmd, cwd=project_root,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+
+        def drain_stderr(p):
+            for line in p.stderr:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+
+        t = threading.Thread(target=drain_stderr, args=(proc,), daemon=True)
+        t.start()
+
+        proc.wait(timeout=600)
+        t.join(timeout=5)
+
+        if proc.returncode != 0:
+            raise RuntimeError(f"era3d {stage} failed (exit={proc.returncode})")
+
+        sys.stderr.write(f"[era3d] {stage} done\n")
+        sys.stderr.flush()
+
+    return mv_dir
+
+
+def run_refine(mv_dir: str, slrm_dir: str, work_dir: str, debug_dir: str | None = None,
+               normal_flip: list | None = None):
     tmp_dir = f"/tmp/StdGEN/{os.getpid()}"
     os.makedirs(tmp_dir, exist_ok=True)
 
@@ -333,14 +391,19 @@ def run_refine(mv_dir: str, slrm_dir: str, work_dir: str):
     if no_decompose:
         sys.stderr.write("[run_refine] no_decompose mode (level0 only)\n")
         sys.stderr.flush()
-        _run_refine_subprocess("refine_level", tmp_dir, {
+        params = {
             "slrm_dir": slrm_dir,
             "mv_dir": mv_dir,
             "level": 0,
             "mesh_idx": 0,
             "tmp_dir": tmp_dir,
             "no_decompose": True,
-        })
+        }
+        if debug_dir:
+            params["debug_dir"] = debug_dir
+        if normal_flip is not None:
+            params["normal_flip"] = normal_flip
+        _run_refine_subprocess("refine_level", tmp_dir, params)
     else:
         name_to_level = [(3, 2), (1, 1), (2, 0)]
 
@@ -363,6 +426,8 @@ def run_refine(mv_dir: str, slrm_dir: str, work_dir: str):
                 "mesh_idx": mesh_idx,
                 "tmp_dir": tmp_dir,
             }
+            if debug_dir:
+                params["debug_dir"] = debug_dir
 
             sys.stderr.write(f"[run_refine] level={level} start\n")
             sys.stderr.flush()
@@ -651,6 +716,7 @@ def combine_refined_glbs(refine_dir: str, output_path: str, target_faces: int = 
 def process_request(ctx, request: dict) -> dict:
     import torch
 
+    mode = ctx.get("mode", "stdgen")
     image_path = request["image"]
     output_path = request["output"]
     seed = request.get("seed", 42)
@@ -660,14 +726,16 @@ def process_request(ctx, request: dict) -> dict:
     t0 = time.monotonic()
 
     t_mv = time.monotonic()
-    mv_dir = run_multiview(ctx, image_path, work_dir, seed)
-    multiview_ms = (time.monotonic() - t_mv) * 1000.0
-    sys.stderr.write(f"Multiview: {multiview_ms:.0f}ms\n")
-    sys.stderr.flush()
-
-    del ctx["multiview_pipeline"]
+    if mode == "era3d":
+        mv_dir = run_era3d_multiview(image_path, work_dir, seed)
+    else:
+        mv_dir = run_multiview(ctx, image_path, work_dir, seed)
+        del ctx["multiview_pipeline"]
     gc.collect()
     torch.cuda.empty_cache()
+    multiview_ms = (time.monotonic() - t_mv) * 1000.0
+    sys.stderr.write(f"Multiview ({mode}): {multiview_ms:.0f}ms\n")
+    sys.stderr.flush()
 
     t_slrm = time.monotonic()
     slrm_dir = run_slrm(ctx, mv_dir, work_dir)
@@ -679,8 +747,10 @@ def process_request(ctx, request: dict) -> dict:
     gc.collect()
     torch.cuda.empty_cache()
 
+    normal_flip = [1, 1, -1] if mode == "era3d" else None
+
     t_refine = time.monotonic()
-    refine_dir = run_refine(mv_dir, slrm_dir, work_dir)
+    refine_dir = run_refine(mv_dir, slrm_dir, work_dir, normal_flip=normal_flip)
     refine_ms = (time.monotonic() - t_refine) * 1000.0
     sys.stderr.write(f"Refine: {refine_ms:.0f}ms\n")
     sys.stderr.flush()
@@ -690,10 +760,13 @@ def process_request(ctx, request: dict) -> dict:
         refine_dir, output_path, target_faces=target_faces,
     )
 
-    sys.stderr.write("Reloading multiview + S-LRM...\n")
+    sys.stderr.write("Reloading S-LRM...\n")
     sys.stderr.flush()
-    ctx["multiview_pipeline"] = load_multiview_pipeline(ctx["device"])
     ctx["slrm_model"], ctx["slrm_infer_config"] = load_slrm_model(ctx["device"])
+    if mode != "era3d":
+        sys.stderr.write("Reloading multiview...\n")
+        sys.stderr.flush()
+        ctx["multiview_pipeline"] = load_multiview_pipeline(ctx["device"])
 
     total_ms = (time.monotonic() - t0) * 1000.0
 
@@ -709,14 +782,14 @@ def process_request(ctx, request: dict) -> dict:
     }
 
 
-def daemon_main():
+def daemon_main(mode: str = "stdgen"):
     import torch
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     t0 = time.monotonic()
-    ctx = load_all(device)
-    sys.stderr.write(f"StdGEN ready ({time.monotonic() - t0:.1f}s)\n")
+    ctx = load_all(device, mode=mode)
+    sys.stderr.write(f"{mode} ready ({time.monotonic() - t0:.1f}s)\n")
     sys.stderr.flush()
 
     print(READY_MARKER, flush=True)
@@ -737,14 +810,15 @@ def daemon_main():
 
         print(f"{RESULT_MARKER_START}{json.dumps(result)}{RESULT_MARKER_END}", flush=True)
 
-    sys.stderr.write("StdGEN worker shutting down\n")
+    sys.stderr.write(f"{mode} worker shutting down\n")
     sys.stderr.flush()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--daemon", action="store_true")
+    parser.add_argument("--mode", default="stdgen", choices=["stdgen", "era3d"])
     args = parser.parse_args()
 
     if args.daemon:
-        daemon_main()
+        daemon_main(mode=args.mode)

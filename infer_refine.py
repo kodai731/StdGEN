@@ -12,7 +12,7 @@ import scipy
 from PIL import Image
 
 from refine.mesh_refine import geo_refine
-from refine.func import make_star_cameras_orthographic
+from refine.func import STDGEN_VIEWS, make_star_cameras_orthographic
 from refine.render import NormalsRenderer, calc_vertex_normals
 
 from pytorch3d.structures import Meshes
@@ -233,7 +233,7 @@ if __name__ == '__main__':
         distract_mask = None
 
         mv, proj = make_star_cameras_orthographic(8, 1, r=1.2)
-        mv = mv[[4, 3, 2, 0, 6, 5]]        
+        mv = mv[STDGEN_VIEWS.camera_indices]
         renderer = NormalsRenderer(mv,proj,(1024,1024))
 
         log_vram("before refine loop")
